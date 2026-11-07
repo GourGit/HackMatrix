@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from fastapi import APIRouter, BackgroundTasks, Depends, Path, Request, status
@@ -19,8 +19,22 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.api.deps import get_db, get_request_id, get_tenant_id
-from app.core.errors import ErrorCode, InvalidURLError, NotFoundError
+from app.api.deps import (
+    AuthenticatedIdentity,
+    get_current_identity,
+    get_db,
+    get_request_id,
+    get_tenant_id,
+)
+from app.config import settings
+from app.core.errors import (
+    ErrorCode,
+    InvalidURLError,
+    NotFoundError,
+    SafeScanNotAllowedError,
+    UnauthorizedScopeError,
+)
+from app.core.scope_validator import validate_scope_authorization
 from app.core.url_validator import normalize_url
 from app.database import async_session_factory
 from app.middleware.rate_limit import limiter
@@ -33,12 +47,22 @@ from app.schemas.common import AssessmentStatus, CheckAvailability, ScopeStatus,
 router = APIRouter(prefix="/assessments", tags=["assessments"])
 
 
-async def _run_orchestration_background(assessment_id: uuid.UUID):
+async def _run_orchestration_background(
+    assessment_id: uuid.UUID,
+    safe_scan_enabled: bool,
+    safe_scan_ports: list[int],
+    crypto_scam_analysis: bool,
+):
     """Background task running orchestrator with a dedicated DB session."""
     async with async_session_factory() as session:
         try:
             orch = AssessmentOrchestrator(session)
-            await orch.execute_assessment(assessment_id)
+            await orch.execute_assessment(
+                assessment_id=assessment_id,
+                safe_scan_enabled=safe_scan_enabled,
+                safe_scan_ports=safe_scan_ports,
+                crypto_scam_analysis=crypto_scam_analysis,
+            )
         except Exception as e:
             stmt = select(Assessment).where(Assessment.id == assessment_id)
             res = await session.execute(stmt)
@@ -61,12 +85,12 @@ async def create_assessment(
     payload: CreateAssessmentRequest,
     db: AsyncSession = Depends(get_db),
     request_id: str = Depends(get_request_id),
-    tenant_id: uuid.UUID = Depends(get_tenant_id),
+    identity: AuthenticatedIdentity = Depends(get_current_identity),
 ) -> JSONResponse:
     """Queue a new security assessment for the given URL.
 
-    Normalizes the URL, checks SSRF safety, creates an assessment record,
-    and dispatches the six analyzers in the background.
+    Enforces scope ownership, active validity, target coverage,
+    and safe scan permissions before scheduling execution.
     """
     raw_url = str(payload.url)
     try:
@@ -74,26 +98,65 @@ async def create_assessment(
     except Exception as e:
         raise InvalidURLError(message=str(e), detail=raw_url)
 
-    # Ensure or create an authorization scope
+    # 1. Attestation check
+    if not payload.authorization or not payload.authorization.attested:
+        raise UnauthorizedScopeError("Authorization attestation is required.")
+
+    # 2. Scope validation
     scope_id = payload.authorization.scope_id if payload.authorization else None
-    if not scope_id:
+    safe_scan_requested = bool(payload.safe_scan and payload.safe_scan.enabled)
+    requested_ports = payload.safe_scan.ports if (payload.safe_scan and payload.safe_scan.ports) else []
+
+    if scope_id:
+        stmt = select(AuthorizationScope).where(
+            AuthorizationScope.id == scope_id,
+            AuthorizationScope.tenant_id == identity.tenant_id,
+        )
+        res = await db.execute(stmt)
+        scope = res.scalar_one_or_none()
+        if not scope:
+            raise UnauthorizedScopeError(
+                f"Authorization scope {scope_id} does not exist or belongs to another tenant."
+            )
+        # Validate rules on scope
+        validate_scope_authorization(
+            scope=scope,
+            normalized_url=norm_result.normalized_str,
+            safe_scan_requested=safe_scan_requested,
+            requested_ports=requested_ports,
+        )
+    else:
+        # Development auto-scope only permitted in non-production
+        if settings.is_production:
+            raise UnauthorizedScopeError("Explicit pre-registered scope_id is required in production.")
+
+        now = datetime.now(timezone.utc)
         scope_id = uuid.uuid4()
-        auth_scope = AuthorizationScope(
+        scope = AuthorizationScope(
             id=scope_id,
-            tenant_id=tenant_id,
-            subject_id="anonymous",
+            tenant_id=identity.tenant_id,
+            subject_id=identity.subject_id,
             targets_json=[norm_result.normalized_str],
-            allowed_ports_json=payload.safe_scan.ports if payload.safe_scan else [],
-            attestation=payload.authorization.attested if payload.authorization else True,
+            allowed_ports_json=requested_ports if safe_scan_requested else None,
+            valid_from=now,
+            valid_until=now + timedelta(days=7),
+            attestation="Development auto-attestation",
             status=ScopeStatus.ACTIVE.value,
         )
-        db.add(auth_scope)
+        db.add(scope)
         await db.flush()
+
+    # 3. Check Crypto Scam option against server feature flag
+    crypto_analysis = bool(
+        payload.options
+        and payload.options.crypto_scam_analysis
+        and settings.crypto_scam_analysis_enabled
+    )
 
     assessment_id = uuid.uuid4()
     assessment = Assessment(
         id=assessment_id,
-        tenant_id=tenant_id,
+        tenant_id=identity.tenant_id,
         scope_id=scope_id,
         submitted_url=raw_url,
         normalized_url=norm_result.normalized_str,
@@ -102,8 +165,14 @@ async def create_assessment(
     db.add(assessment)
     await db.commit()
 
-    # Trigger background agent orchestration
-    background_tasks.add_task(_run_orchestration_background, assessment_id)
+    # Trigger background agent orchestration with approved immutable context
+    background_tasks.add_task(
+        _run_orchestration_background,
+        assessment_id=assessment_id,
+        safe_scan_enabled=safe_scan_requested,
+        safe_scan_ports=requested_ports,
+        crypto_scam_analysis=crypto_analysis,
+    )
 
     return JSONResponse(
         status_code=status.HTTP_202_ACCEPTED,

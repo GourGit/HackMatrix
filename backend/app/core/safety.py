@@ -114,29 +114,21 @@ def validate_ip_safety(ip: str) -> None:
 async def resolve_and_validate(hostname: str) -> list[str]:
     """Resolve *hostname* via DNS and validate every returned IP.
 
-    Performs both A (IPv4) and AAAA (IPv6) lookups.  Every IP in the
-    response set is validated against the blocked-range list.  If *any*
-    address is unsafe the entire resolution is rejected — this prevents
-    DNS rebinding attacks where a benign record is mixed with an internal
-    address.
-
-    The caller should **pin** the returned IP list and use it for all
-    subsequent connections to defend against TOCTOU / DNS rebinding.
-
-    Args:
-        hostname: The IDNA-normalized hostname to resolve.
-
-    Returns:
-        A list of validated, safe IP address strings.
-
-    Raises:
-        InvalidURLError: If DNS resolution fails entirely.
-        UnsafeTargetError: If any resolved IP is in a blocked range.
+    If hostname is already an IP address literal, validates it directly
+    without performing a remote DNS query.
     """
+    # Check IP literal directly
+    try:
+        ipaddress.ip_address(hostname)
+        validate_ip_safety(hostname)
+        return [hostname]
+    except ValueError:
+        pass
+
     resolved_ips: list[str] = []
 
     resolver = dns.asyncresolver.Resolver()
-    resolver.lifetime = float(settings.http_timeout_seconds)
+    resolver.lifetime = min(3.0, float(settings.http_timeout_seconds))
 
     # Try both A and AAAA; accumulate results.
     for rdtype in (dns.rdatatype.A, dns.rdatatype.AAAA):

@@ -33,11 +33,7 @@ def _to_camel(name: str) -> str:
 
 
 class AuthorizationInput(BaseModel):
-    """Caller's attestation that they are authorized to assess the target.
-
-    ``scope_id`` references the pre-registered scope that covers the
-    target hostname and, when safe-scan is requested, the approved ports.
-    """
+    """Caller's attestation that they are authorized to assess the target."""
 
     model_config = ConfigDict(
         populate_by_name=True,
@@ -49,9 +45,9 @@ class AuthorizationInput(BaseModel):
         description="Whether the caller attests authorization for the target.",
         examples=[True],
     )
-    scope_id: uuid.UUID = Field(
-        ...,
-        description="Scope identifier that covers the target host.",
+    scope_id: uuid.UUID | None = Field(
+        default=None,
+        description="Scope identifier covering the target host. Optional in dev.",
         examples=["a1b2c3d4-e5f6-7890-abcd-ef1234567890"],
     )
 
