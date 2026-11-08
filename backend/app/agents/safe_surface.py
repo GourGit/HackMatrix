@@ -41,7 +41,7 @@ class SafeSurfaceAgent(BaseAgent):
         parsed = urlparse(context.target_url)
         hostname = parsed.hostname or context.target_url
 
-        allowed_ports = context.safe_scan_ports or [80, 443]
+        allowed_ports = context.safe_scan_ports if context.safe_scan_ports is not None else []
         observed_services = []
 
         loop = asyncio.get_running_loop()

@@ -42,7 +42,13 @@ class AssessmentOrchestrator:
         ]
         self.scorer = RiskScoreCalculator()
 
-    async def execute_assessment(self, assessment_id: uuid.UUID) -> Assessment:
+    async def execute_assessment(
+        self,
+        assessment_id: uuid.UUID,
+        safe_scan_enabled: bool = False,
+        safe_scan_ports: list[int] | None = None,
+        crypto_scam_analysis: bool = False,
+    ) -> Assessment:
         """Runs all 6 agents concurrently and updates the database records."""
         # 1. Fetch Assessment
         stmt = select(Assessment).where(Assessment.id == assessment_id)
@@ -53,6 +59,9 @@ class AssessmentOrchestrator:
 
         assessment.status = AssessmentStatus.RUNNING.value
         await self.db.commit()
+
+        # Ensure safe-scan ports default to an empty list, never an implicit broad port set
+        effective_safe_scan_ports = list(safe_scan_ports) if safe_scan_ports is not None else []
 
         # 2. Build Execution Contexts & Agent Run Records
         tasks = []
@@ -77,8 +86,9 @@ class AssessmentOrchestrator:
                 target_url=assessment.submitted_url,
                 normalized_url=assessment.normalized_url,
                 scope_id=assessment.scope_id,
-                safe_scan_enabled=False,  # default safe
-                crypto_scam_analysis=False,
+                safe_scan_enabled=safe_scan_enabled,
+                safe_scan_ports=effective_safe_scan_ports,
+                crypto_scam_analysis=crypto_scam_analysis,
             )
             tasks.append(self._run_with_timeout(agent, ctx))
 
