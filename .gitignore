@@ -1,0 +1,82 @@
+# Version control metadata
+.git/
+
+# Bytecode & Python artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+/build/
+/develop-eggs/
+/dist/
+/downloads/
+/eggs/
+/.eggs/
+/lib/
+/lib64/
+/parts/
+/sdist/
+/var/
+/wheels/
+backend/build/
+backend/dist/
+backend/lib/
+backend/lib64/
+backend/parts/
+backend/sdist/
+backend/wheels/
+backend/*.egg-info/
+*.egg-info/
+.installed.cfg
+*.egg
+!frontend/src/lib/
+
+# Testing & linting caches
+.pytest_cache/
+.tox/
+.coverage
+.coverage.*
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+.cache/
+
+# Dependencies
+node_modules/
+jspm_packages/
+
+# Environment files & secrets (NEVER commit secrets)
+.env
+.env.*
+!.env.example
+*.env
+*.pem
+*.key
+*.cert
+*.crt
+
+# Evidence storage & persistent artifacts
+evidence_store/
+**/evidence_store/
+*.evidence
+
+# Frontend build artifacts
+frontend/dist/
+frontend/build/
+
+# Operating system files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE & Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+*.log
+logs/
+

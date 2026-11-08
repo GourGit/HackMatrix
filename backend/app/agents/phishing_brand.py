@@ -51,7 +51,7 @@ class PhishingBrandAgent(BaseAgent):
             ratio = Levenshtein.ratio(domain_name, brand)
 
             if (dist in (1, 2) and len(domain_name) >= 4) or (ratio > 0.82 and brand in domain_name):
-                ev_id = uuid.uuid4()
+                brand_ev_id = uuid.uuid4()
                 result.findings.append(
                     self.create_finding(
                         context=context,
@@ -61,10 +61,18 @@ class PhishingBrandAgent(BaseAgent):
                         title=f"Potential Typosquatting of Brand '{brand}'",
                         description=f"Domain '{domain_name}' is suspiciously similar to major brand '{brand}' (edit distance: {dist}, similarity: {ratio:.2f}).",
                         affected_asset=context.target_url,
-                        evidence_ids=[ev_id],
+                        evidence_ids=[brand_ev_id],
                         score_impact=20,
                     )
                 )
+                result.raw_evidence.append({
+                    "evidence_id": brand_ev_id,
+                    "kind": EvidenceKind.PROVIDER_RESULT,
+                    "brand": brand,
+                    "domain": domain_name,
+                    "distance": dist,
+                    "ratio": ratio,
+                })
 
         # 2. Page Content & Form Inspection via central egress layer
         try:
@@ -77,6 +85,15 @@ class PhishingBrandAgent(BaseAgent):
                 password_inputs = soup.find_all("input", {"type": re.compile(r"^password$", re.I)})
                 forms = soup.find_all("form")
 
+                page_ev_id = uuid.uuid4()
+                result.raw_evidence.append({
+                    "evidence_id": page_ev_id,
+                    "kind": EvidenceKind.HTML_CONTENT,
+                    "url": context.target_url,
+                    "password_inputs_count": len(password_inputs),
+                    "forms_count": len(forms),
+                })
+
                 if password_inputs:
                     suspicious_action = False
                     for f in forms:
@@ -84,7 +101,6 @@ class PhishingBrandAgent(BaseAgent):
                         if action.startswith("http://"):
                             suspicious_action = True
 
-                    ev_id = uuid.uuid4()
                     severity = Severity.HIGH if suspicious_action else Severity.MEDIUM
                     score = 20 if suspicious_action else 8
                     desc = "Form asking for user credentials (password field detected)."
@@ -100,7 +116,7 @@ class PhishingBrandAgent(BaseAgent):
                             title="Password / Credential Input Detected",
                             description=desc,
                             affected_asset=context.target_url,
-                            evidence_ids=[ev_id],
+                            evidence_ids=[page_ev_id],
                             score_impact=score,
                         )
                     )
@@ -111,7 +127,6 @@ class PhishingBrandAgent(BaseAgent):
                     page_text = soup.get_text().lower()
                     matches = [k for k in crypto_keywords if k in page_text]
                     if matches:
-                        ev_id = uuid.uuid4()
                         result.findings.append(
                             self.create_finding(
                                 context=context,
@@ -121,7 +136,7 @@ class PhishingBrandAgent(BaseAgent):
                                 title="Cryptocurrency Scam Heuristics Triggered",
                                 description=f"Identified suspicious cryptocurrency recovery/giveaway phrasing: {', '.join(matches)}.",
                                 affected_asset=context.target_url,
-                                evidence_ids=[ev_id],
+                                evidence_ids=[page_ev_id],
                                 score_impact=20,
                             )
                         )

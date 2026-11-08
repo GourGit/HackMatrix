@@ -84,9 +84,17 @@ def validate_scope_authorization(
         raise UnauthorizedScopeError(f"Scope is not active (current status: {scope.status}).")
 
     # 2. Validity window
-    if scope.valid_from and now < scope.valid_from:
+    valid_from = scope.valid_from
+    if valid_from and valid_from.tzinfo is None:
+        valid_from = valid_from.replace(tzinfo=timezone.utc)
+
+    valid_until = scope.valid_until
+    if valid_until and valid_until.tzinfo is None:
+        valid_until = valid_until.replace(tzinfo=timezone.utc)
+
+    if valid_from and now < valid_from:
         raise UnauthorizedScopeError("Scope validity window has not started yet.")
-    if scope.valid_until and now > scope.valid_until:
+    if valid_until and now > valid_until:
         raise UnauthorizedScopeError("Scope validity has expired.")
 
     # 3. Target matching

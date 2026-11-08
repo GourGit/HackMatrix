@@ -2,16 +2,15 @@
 
 Allows an authorized reviewer to record an accepted, disputed, or
 false_positive verdict on a specific finding, creating an immutable
-audit event with full actor lineage.
+audit event with full actor lineage and updating persisted review fields.
 """
 
 from __future__ import annotations
 
 import uuid
 from datetime import datetime, timezone
-from typing import Any
 
-from fastapi import APIRouter, Depends, Path, status
+from fastapi import APIRouter, Depends, Path, Request, status
 from fastapi.responses import JSONResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -22,15 +21,15 @@ from app.middleware.rate_limit import limiter
 from app.models.assessment import Assessment
 from app.models.audit import AuditEvent
 from app.models.finding import Finding
-from app.schemas.common import FindingStatus
-from app.schemas.finding import FindingReviewRequest
+from app.schemas.common import ReviewDecision
+from app.schemas.finding import FindingReviewRequest, FindingReviewResponse
 
 router = APIRouter(prefix="/findings", tags=["findings"])
 
 _VALID_DECISIONS = {
-    FindingStatus.ACCEPTED.value,
-    FindingStatus.DISPUTED.value,
-    FindingStatus.FALSE_POSITIVE.value,
+    ReviewDecision.ACCEPTED.value,
+    ReviewDecision.DISPUTED.value,
+    ReviewDecision.FALSE_POSITIVE.value,
 }
 
 
@@ -38,10 +37,11 @@ _VALID_DECISIONS = {
     "/{finding_id}/review",
     summary="Record a review decision on a finding",
     status_code=status.HTTP_200_OK,
-    response_class=JSONResponse,
+    response_model=FindingReviewResponse,
 )
 @limiter.limit("20/minute")
 async def review_finding(
+    request: Request,
     payload: FindingReviewRequest,
     finding_id: uuid.UUID = Path(..., description="Finding UUID"),
     *,
@@ -51,52 +51,70 @@ async def review_finding(
 ) -> JSONResponse:
     """Record a review decision on the specified finding.
 
-    Persists the updated review status, reviewer actor ID, and an append-only
-    audit event storing previous status and review rationale.
+    Persists the updated review status, decision, rationale, reviewer actor ID,
+    reviewed timestamp, and an append-only audit event storing previous status
+    and review rationale.
     """
-    decision = payload.status.value if hasattr(payload.status, "value") else str(payload.status)
-    rationale = payload.rationale or ""
+    decision = payload.decision.value if hasattr(payload.decision, "value") else str(payload.decision)
+    rationale = payload.rationale.strip()
 
     if decision not in _VALID_DECISIONS:
         raise TrustLensError(
             code=ErrorCode.VALIDATION_ERROR,
             message=f"Invalid decision '{decision}'. Must be one of: {', '.join(sorted(_VALID_DECISIONS))}.",
-            status_code=422,
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
         )
 
-    # Load finding and join assessment to enforce tenant boundary
+    # 1. Load finding and join assessment to enforce tenant boundary with row lock on finding
     stmt = (
-        select(Finding)
-        .join(Assessment, Finding.assessment_id == Assessment.id)
-        .where(
-            Finding.id == finding_id,
-            Assessment.tenant_id == identity.tenant_id,
-        )
+        select(Finding, Assessment)
+        .outerjoin(Assessment, Finding.assessment_id == Assessment.id)
+        .where(Finding.id == finding_id)
+        .with_for_update(of=Finding)
     )
     result = await db.execute(stmt)
-    finding = result.scalar_one_or_none()
+    row = result.first()
 
-    if finding is None:
+    if row is None:
         raise NotFoundError("Finding", detail=str(finding_id))
 
-    prior_status = finding.status
+    finding, assessment = row
+    if assessment is None or (assessment.tenant_id != identity.tenant_id and not identity.is_admin):
+        raise TrustLensError(
+            code="FORBIDDEN",
+            message="Access to this finding is not authorized.",
+            status_code=status.HTTP_403_FORBIDDEN,
+        )
 
-    # Update status
-    finding.status = decision
+    # 2. Capture previous_status BEFORE changing the finding
+    previous_status = (
+        finding.status.value
+        if hasattr(finding.status, "value")
+        else str(finding.status)
+    )
+
     review_time = datetime.now(timezone.utc)
 
-    # Append-only audit trail
+    # 3. Persist finding review fields
+    finding.status = decision
+    finding.decision = decision
+    finding.reviewer_id = identity.subject_id
+    finding.reviewed_at = review_time
+    finding.rationale = rationale
+
+    # 4. Build valid append-only audit event using actual model fields
     audit = AuditEvent(
         id=uuid.uuid4(),
-        tenant_id=identity.tenant_id,
+        tenant_id=assessment.tenant_id,
         actor_id=identity.subject_id,
         action="finding.reviewed",
         entity_type="finding",
-        entity_id=finding_id,
+        entity_id=finding.id,
         metadata_json={
+            "previous_status": previous_status,
+            "new_status": decision,
             "decision": decision,
             "rationale": rationale,
-            "previous_status": prior_status,
         },
         occurred_at=review_time,
     )
@@ -108,8 +126,11 @@ async def review_finding(
         content={
             "findingId": str(finding_id),
             "status": decision,
+            "decision": decision,
             "reviewedAt": review_time.isoformat(),
             "reviewerId": str(identity.subject_id),
+            "reviewedBy": str(identity.subject_id),
+            "rationale": rationale,
         },
         headers={"X-Request-ID": request_id},
     )

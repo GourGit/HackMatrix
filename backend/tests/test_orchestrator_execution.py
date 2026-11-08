@@ -1,7 +1,7 @@
 """Tests for assessment execution and option dispatching."""
 
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -475,6 +475,111 @@ async def test_orchestrator_unhandled_exception_rolls_back_and_marks_failed(db_s
     for r in runs:
         assert r.status == AgentRunStatus.FAILED.value
         assert r.error_code == "ORCHESTRATOR_ERROR"
+
+
+@pytest.mark.asyncio
+async def test_safe_surface_service_observation_deduplication(db_session):
+    """Verify that ServiceObservation deduplicates duplicate service entries across formats."""
+    from app.models.service import ServiceObservation
+
+    tenant_id = uuid.uuid4()
+    scope_id = uuid.uuid4()
+    assessment_id = uuid.uuid4()
+
+    now = datetime.now(timezone.utc)
+    scope = AuthorizationScope(
+        id=scope_id,
+        tenant_id=tenant_id,
+        subject_id=uuid.uuid4(),
+        targets_json=["https://example.com"],
+        valid_from=now,
+        valid_until=now + timedelta(days=1),
+        status=ScopeStatus.ACTIVE.value,
+    )
+    db_session.add(scope)
+
+    assessment = Assessment(
+        id=assessment_id,
+        tenant_id=tenant_id,
+        scope_id=scope_id,
+        submitted_url="https://example.com",
+        normalized_url="https://example.com",
+        status=AssessmentStatus.QUEUED.value,
+    )
+    db_session.add(assessment)
+    await db_session.commit()
+
+    orchestrator = AssessmentOrchestrator(db_session)
+
+    surf_ev_id = uuid.uuid4()
+    for agent in orchestrator.agents:
+        if agent.agent_name == AgentName.SAFE_SURFACE:
+            agent.run = AsyncMock(return_value=AgentExecutionResult(
+                agent_name=agent.agent_name,
+                status=AgentRunStatus.COMPLETED,
+                raw_evidence=[
+                    {
+                        "evidence_id": str(surf_ev_id),
+                        "services": [
+                            # Port 443 with no banner initially
+                            {"port": 443, "protocol": "tcp"},
+                            {"port": 80, "protocol": "tcp", "banner": "apache"},
+                            # Invalid port values that must be safely ignored:
+                            {"port": True},
+                            {"port": 80.5},
+                            {"port": " 80 "},
+                            {"port": "invalid"},
+                            {"port": 70000},
+                        ],
+                        # Also direct port 443 with no banner
+                        "port": 443,
+                        "protocol": "tcp",
+                    },
+                    {
+                        "evidence_id": str(uuid.uuid4()),
+                        # Subsequent direct port 443 with a banner that fills the missing banner
+                        "port": 443,
+                        "protocol": "tcp",
+                        "banner": "nginx/1.24",
+                    },
+                    {
+                        "evidence_id": str(uuid.uuid4()),
+                        # Distinct service on 8443
+                        "port": 8443,
+                        "protocol": "tcp",
+                        "banner": "custom-admin",
+                    },
+                ],
+                findings=[],
+                ended_at=datetime.now(timezone.utc),
+            ))
+        else:
+            agent.run = AsyncMock(return_value=AgentExecutionResult(
+                agent_name=agent.agent_name,
+                status=AgentRunStatus.COMPLETED,
+                raw_evidence=[],
+                findings=[],
+                ended_at=datetime.now(timezone.utc),
+            ))
+
+    await orchestrator.execute_assessment(
+        assessment_id=assessment_id,
+        safe_scan_enabled=True,
+    )
+
+    stmt = select(ServiceObservation).where(ServiceObservation.assessment_id == assessment_id)
+    res = await db_session.execute(stmt)
+    observations = res.scalars().all()
+
+    # Ports 443, 80, 8443 each appear exactly once
+    ports = [o.port for o in observations]
+    assert len(observations) == 3
+    assert set(ports) == {443, 80, 8443}
+
+    obs_443 = next(o for o in observations if o.port == 443)
+    assert obs_443.banner == "nginx/1.24"
+    assert obs_443.protocol == "tcp"
+
 
 
 

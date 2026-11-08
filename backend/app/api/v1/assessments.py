@@ -9,6 +9,7 @@ findings, checks, and risk contributions.
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -33,16 +34,28 @@ from app.core.errors import (
     NotFoundError,
     SafeScanNotAllowedError,
     UnauthorizedScopeError,
+    UnsafeTargetError,
 )
+from app.core.safety import validate_ip_safety
 from app.core.scope_validator import validate_scope_authorization
 from app.core.url_validator import normalize_url
 from app.database import async_session_factory
 from app.middleware.rate_limit import limiter
 from app.models.assessment import Assessment
 from app.models.authorization import AuthorizationScope
+from app.models.finding import Finding
 from app.orchestrator.engine import AssessmentOrchestrator
 from app.schemas.assessment import CreateAssessmentRequest
-from app.schemas.common import AssessmentStatus, CheckAvailability, ScopeStatus, score_to_band
+from app.schemas.common import (
+    AgentName,
+    AgentRunStatus,
+    AssessmentStatus,
+    CertificateFieldStatus,
+    CheckAvailability,
+    RevocationStatus,
+    ScopeStatus,
+    score_to_band,
+)
 
 router = APIRouter(prefix="/assessments", tags=["assessments"])
 
@@ -97,6 +110,27 @@ async def create_assessment(
         norm_result = normalize_url(raw_url)
     except Exception as e:
         raise InvalidURLError(message=str(e), detail=raw_url)
+
+    # Reject private addresses and localhost upfront (SSRF guardrail)
+    clean_host = norm_result.host.strip().lower().rstrip(".")
+    if (
+        clean_host in ("localhost", "localhost.localdomain", "ip6-localhost", "ip6-loopback")
+        or clean_host.endswith(".localhost")
+    ):
+        raise UnsafeTargetError(
+            "The target hostname resolves to loopback/localhost and is not allowed.",
+            detail={"hostname": norm_result.host, "reason": "localhost"},
+        )
+    ip_to_validate = None
+    raw_ip_str = clean_host.strip("[]")
+    try:
+        ipaddress.ip_address(raw_ip_str)
+        ip_to_validate = raw_ip_str
+    except ValueError:
+        pass
+
+    if ip_to_validate is not None:
+        validate_ip_safety(ip_to_validate)
 
     # 1. Attestation check
     if not payload.authorization or not payload.authorization.attested:
@@ -201,10 +235,15 @@ async def get_assessment(
     """Return the full assessment detail including risk score, findings, and checks."""
     stmt = (
         select(Assessment)
-        .where(Assessment.id == assessment_id)
+        .where(
+            Assessment.id == assessment_id,
+            Assessment.tenant_id == tenant_id,
+        )
         .options(
             selectinload(Assessment.agent_runs),
-            selectinload(Assessment.findings),
+            selectinload(Assessment.findings).selectinload(Finding.evidence_items),
+            selectinload(Assessment.certificate_observations),
+            selectinload(Assessment.service_observations),
         )
     )
     result = await db.execute(stmt)
@@ -228,7 +267,7 @@ async def get_assessment(
 
     findings_payload = []
     for f in findings:
-        evidence_ids = [str(fe.evidence_id) for fe in getattr(f, "evidences", [])] if hasattr(f, "evidences") else []
+        evidence_ids = [str(ev.id) for ev in (getattr(f, "evidence_items", []) or [])]
         findings_payload.append({
             "findingId": str(f.id),
             "agent": f.agent_run_id and next((r.agent_name for r in agent_runs if r.id == f.agent_run_id), "") or "",
@@ -239,16 +278,157 @@ async def get_assessment(
             "evidenceIds": evidence_ids,
         })
 
-    checks = {
-        "ct": "passed" if total_score < 75 else "unknown",
-        "revocation": "unknown",
-        "safeScan": "not_requested",
-    }
-    for r in agent_runs:
-        if r.agent_name == "certificate-intelligence" and r.status == "completed":
-            checks["ct"] = "passed"
-        if r.agent_name == "safe-surface" and r.status == "completed":
-            checks["safeScan"] = "completed"
+    # Durable / truthful check availability determination
+    if getattr(assessment, "checks_json", None):
+        checks = assessment.checks_json
+    else:
+        cert_obs = assessment.certificate_observations[0] if getattr(assessment, "certificate_observations", None) else None
+        cert_run = next(
+            (r for r in agent_runs if r.agent_name in (AgentName.CERTIFICATE_INTELLIGENCE.value, "certificate-intelligence")),
+            None,
+        )
+        finding_types = {f.type for f in findings}
+
+        # Safe surface scan status
+        safe_scan_run = next(
+            (r for r in agent_runs if r.agent_name in (AgentName.SAFE_SURFACE.value, "safe-surface")),
+            None,
+        )
+        has_service_obs = bool(getattr(assessment, "service_observations", None))
+        if safe_scan_run is None:
+            safe_scan_state = CheckAvailability.NOT_REQUESTED.value
+        elif safe_scan_run.status in (AgentRunStatus.FAILED.value, AgentRunStatus.TIMEOUT.value):
+            safe_scan_state = CheckAvailability.FAILED.value
+        elif safe_scan_run.status == AgentRunStatus.UNAVAILABLE.value:
+            safe_scan_state = CheckAvailability.UNAVAILABLE.value
+        elif safe_scan_run.status == AgentRunStatus.COMPLETED.value:
+            safe_scan_state = CheckAvailability.PASSED.value if has_service_obs else CheckAvailability.NOT_REQUESTED.value
+        else:
+            safe_scan_state = CheckAvailability.UNKNOWN.value
+
+        # Certificate & TLS checks
+        target_url = assessment.submitted_url or assessment.normalized_url or ""
+        is_http = target_url.startswith("http://") or "certificate.unencrypted_http" in finding_types
+
+        if is_http:
+            ct_state = CheckAvailability.NOT_REQUESTED.value
+            rev_state = CheckAvailability.NOT_REQUESTED.value
+            ca_state = CheckAvailability.NOT_REQUESTED.value
+            host_state = CheckAvailability.NOT_REQUESTED.value
+            val_state = CheckAvailability.NOT_REQUESTED.value
+            tls_state = CheckAvailability.NOT_REQUESTED.value
+            crypto_state = CheckAvailability.NOT_REQUESTED.value
+        elif cert_run is None:
+            ct_state = CheckAvailability.NOT_REQUESTED.value
+            rev_state = CheckAvailability.NOT_REQUESTED.value
+            ca_state = CheckAvailability.NOT_REQUESTED.value
+            host_state = CheckAvailability.NOT_REQUESTED.value
+            val_state = CheckAvailability.NOT_REQUESTED.value
+            tls_state = CheckAvailability.NOT_REQUESTED.value
+            crypto_state = CheckAvailability.NOT_REQUESTED.value
+        elif cert_run.status in (AgentRunStatus.FAILED.value, AgentRunStatus.UNAVAILABLE.value, AgentRunStatus.TIMEOUT.value) and not cert_obs:
+            ct_state = CheckAvailability.UNAVAILABLE.value
+            rev_state = CheckAvailability.UNAVAILABLE.value
+            ca_state = CheckAvailability.UNAVAILABLE.value
+            host_state = CheckAvailability.UNAVAILABLE.value
+            val_state = CheckAvailability.UNAVAILABLE.value
+            tls_state = CheckAvailability.UNAVAILABLE.value
+            crypto_state = CheckAvailability.UNAVAILABLE.value
+        else:
+            # CT presence
+            if "certificate.missing_sct" in finding_types:
+                ct_state = CheckAvailability.FAILED.value
+            elif cert_obs and cert_obs.ct_status == CertificateFieldStatus.VALID:
+                ct_state = CheckAvailability.PASSED.value
+            else:
+                ct_state = CheckAvailability.UNKNOWN.value
+
+            # Revocation status (Never report good because a network request failed)
+            if "certificate.revoked" in finding_types:
+                rev_state = CheckAvailability.FAILED.value
+            elif "certificate.revocation_unknown" in finding_types:
+                rev_state = CheckAvailability.UNKNOWN.value
+            elif cert_obs:
+                if cert_obs.revocation_status == RevocationStatus.GOOD:
+                    rev_state = CheckAvailability.PASSED.value
+                elif cert_obs.revocation_status == RevocationStatus.REVOKED:
+                    rev_state = CheckAvailability.FAILED.value
+                elif cert_obs.revocation_status == RevocationStatus.UNAVAILABLE:
+                    rev_state = CheckAvailability.UNAVAILABLE.value
+                else:
+                    rev_state = CheckAvailability.UNKNOWN.value
+            else:
+                rev_state = CheckAvailability.UNKNOWN.value
+
+            # CA Chain
+            if "certificate.untrusted_ca" in finding_types:
+                ca_state = CheckAvailability.FAILED.value
+            elif cert_obs and cert_obs.ca_status == CertificateFieldStatus.VALID:
+                ca_state = CheckAvailability.PASSED.value
+            elif cert_obs and cert_obs.ca_status == CertificateFieldStatus.INVALID:
+                ca_state = CheckAvailability.FAILED.value
+            elif cert_run.status == AgentRunStatus.COMPLETED.value:
+                ca_state = CheckAvailability.PASSED.value
+            else:
+                ca_state = CheckAvailability.UNKNOWN.value
+
+            # Hostname / SAN match
+            if "certificate.san_mismatch" in finding_types:
+                host_state = CheckAvailability.FAILED.value
+            elif cert_obs and cert_obs.hostname_status == CertificateFieldStatus.VALID:
+                host_state = CheckAvailability.PASSED.value
+            elif cert_obs and cert_obs.hostname_status == CertificateFieldStatus.INVALID:
+                host_state = CheckAvailability.FAILED.value
+            elif cert_run.status == AgentRunStatus.COMPLETED.value:
+                host_state = CheckAvailability.PASSED.value
+            else:
+                host_state = CheckAvailability.UNKNOWN.value
+
+            # Validity dates
+            if "certificate.expired" in finding_types or "certificate.not_yet_valid" in finding_types:
+                val_state = CheckAvailability.FAILED.value
+            elif cert_run.status == AgentRunStatus.COMPLETED.value:
+                val_state = CheckAvailability.PASSED.value
+            else:
+                val_state = CheckAvailability.UNKNOWN.value
+
+            # TLS version & cipher
+            if "tls.obsolete_version" in finding_types or "tls.weak_cipher" in finding_types:
+                tls_state = CheckAvailability.FAILED.value
+            elif cert_run.status == AgentRunStatus.COMPLETED.value:
+                tls_state = CheckAvailability.PASSED.value
+            else:
+                tls_state = CheckAvailability.UNKNOWN.value
+
+            # Cryptographic strength
+            if "certificate.weak_key" in finding_types or "certificate.weak_signature" in finding_types:
+                crypto_state = CheckAvailability.FAILED.value
+            elif cert_run.status == AgentRunStatus.COMPLETED.value:
+                crypto_state = CheckAvailability.PASSED.value
+            else:
+                crypto_state = CheckAvailability.UNKNOWN.value
+
+        checks = {
+            "ct": ct_state,
+            "revocation": rev_state,
+            "safeScan": safe_scan_state,
+            "hostnameMatch": host_state,
+            "validityDates": val_state,
+            "caChain": ca_state,
+            "tlsConfiguration": tls_state,
+            "cryptoStrength": crypto_state,
+        }
+
+    agent_runs_payload = [
+        {
+            "agentName": r.agent_name,
+            "status": r.status,
+            "startedAt": r.started_at.isoformat() if r.started_at else None,
+            "endedAt": r.ended_at.isoformat() if r.ended_at else None,
+            "errorCode": r.error_code,
+        }
+        for r in agent_runs
+    ]
 
     return JSONResponse(
         status_code=status.HTTP_200_OK,
@@ -265,6 +445,7 @@ async def get_assessment(
             },
             "findings": findings_payload,
             "checks": checks,
+            "agentRuns": agent_runs_payload,
             "createdAt": assessment.created_at.isoformat() if assessment.created_at else None,
             "completedAt": assessment.completed_at.isoformat() if assessment.completed_at else None,
         },

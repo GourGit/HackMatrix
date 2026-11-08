@@ -64,9 +64,10 @@ logger: structlog.stdlib.BoundLogger = structlog.get_logger("trustlens")
 async def _lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """Manage startup / shutdown tasks for the application.
 
-    Startup: verify the database engine can connect.
+    Startup: enforce production security boundaries and lifecycle.
     Shutdown: dispose of the engine's connection pool.
     """
+    settings.validate_production_security()
     logger.info("startup", env=settings.app_env, debug=settings.app_debug)
     yield
     await engine.dispose()

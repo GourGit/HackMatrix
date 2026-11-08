@@ -19,10 +19,25 @@ export interface RiskDetail {
   contributions: Array<{ findingId: string; points: number }>;
 }
 
+export type CheckStatus = 'passed' | 'failed' | 'unknown' | 'not_requested' | 'unavailable' | 'good' | 'revoked' | 'completed';
+
 export interface ChecksDetail {
-  ct: 'passed' | 'failed' | 'unknown' | 'not_requested';
-  revocation: 'good' | 'revoked' | 'unknown' | 'not_requested';
-  safeScan: 'completed' | 'failed' | 'unknown' | 'not_requested';
+  ct: CheckStatus;
+  revocation: CheckStatus;
+  safeScan: CheckStatus;
+  hostnameMatch?: CheckStatus;
+  validityDates?: CheckStatus;
+  caChain?: CheckStatus;
+  tlsConfiguration?: CheckStatus;
+  cryptoStrength?: CheckStatus;
+}
+
+export interface AgentRunDetail {
+  agentName: string;
+  status: 'queued' | 'running' | 'completed' | 'partial' | 'failed' | 'unavailable' | 'timeout';
+  startedAt?: string | null;
+  endedAt?: string | null;
+  errorCode?: string | null;
 }
 
 export interface AssessmentDetail {
@@ -33,6 +48,7 @@ export interface AssessmentDetail {
   risk: RiskDetail;
   findings: Finding[];
   checks: ChecksDetail;
+  agentRuns?: AgentRunDetail[];
   createdAt?: string;
   completedAt?: string;
 }
@@ -51,4 +67,3 @@ export interface CreateAssessmentPayload {
     cryptoScamAnalysis?: boolean;
   };
 }
-

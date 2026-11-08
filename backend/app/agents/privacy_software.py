@@ -34,6 +34,7 @@ class PrivacySoftwareAgent(BaseAgent):
 
         try:
             resp = await default_egress.fetch_url(context.target_url, follow_redirects=True)
+            privacy_ev_id = uuid.uuid4()
 
             # 1. Inspect Security Headers (case-insensitive lookup)
             raw_headers = resp.headers if resp.headers is not None else {}
@@ -46,7 +47,6 @@ class PrivacySoftwareAgent(BaseAgent):
 
             # Missing HSTS
             if context.target_url.startswith("https://") and "strict-transport-security" not in normalized_headers:
-                ev_id = uuid.uuid4()
                 result.findings.append(
                     self.create_finding(
                         context=context,
@@ -56,14 +56,13 @@ class PrivacySoftwareAgent(BaseAgent):
                         title="Missing Strict-Transport-Security (HSTS) Header",
                         description="The website does not enforce HTTPS via HSTS headers, leaving connections vulnerable to SSL stripping attacks.",
                         affected_asset=context.target_url,
-                        evidence_ids=[ev_id],
+                        evidence_ids=[privacy_ev_id],
                         score_impact=3,
                     )
                 )
 
             # Missing Content-Security-Policy
             if "content-security-policy" not in normalized_headers:
-                ev_id = uuid.uuid4()
                 result.findings.append(
                     self.create_finding(
                         context=context,
@@ -73,7 +72,7 @@ class PrivacySoftwareAgent(BaseAgent):
                         title="Missing Content-Security-Policy Header",
                         description="No CSP header found. A strong CSP helps protect users against Cross-Site Scripting (XSS) and data injection.",
                         affected_asset=context.target_url,
-                        evidence_ids=[ev_id],
+                        evidence_ids=[privacy_ev_id],
                         score_impact=3,
                     )
                 )
@@ -95,7 +94,6 @@ class PrivacySoftwareAgent(BaseAgent):
                 has_samesite = any("samesite" in p for p in lower_parts)
 
                 if not is_secure and context.target_url.startswith("https://"):
-                    ev_id = uuid.uuid4()
                     result.findings.append(
                         self.create_finding(
                             context=context,
@@ -105,13 +103,12 @@ class PrivacySoftwareAgent(BaseAgent):
                             title="Cookie Missing 'Secure' Attribute",
                             description=f"Cookie (hash: {name_hash}) was set without the 'Secure' flag over HTTPS.",
                             affected_asset=context.target_url,
-                            evidence_ids=[ev_id],
+                            evidence_ids=[privacy_ev_id],
                             score_impact=8,
                         )
                     )
 
                 if not is_httponly and "session" in name.lower():
-                    ev_id = uuid.uuid4()
                     result.findings.append(
                         self.create_finding(
                             context=context,
@@ -121,7 +118,7 @@ class PrivacySoftwareAgent(BaseAgent):
                             title="Session Cookie Missing 'HttpOnly' Attribute",
                             description=f"Session-identifying cookie (hash: {name_hash}) lacks HttpOnly protection, making it accessible to client-side scripts.",
                             affected_asset=context.target_url,
-                            evidence_ids=[ev_id],
+                            evidence_ids=[privacy_ev_id],
                             score_impact=8,
                         )
                     )
@@ -133,7 +130,6 @@ class PrivacySoftwareAgent(BaseAgent):
             for s in scripts:
                 src = s.get("src", "").lower()
                 if "jquery-1." in src or "jquery-2." in src:
-                    ev_id = uuid.uuid4()
                     result.findings.append(
                         self.create_finding(
                             context=context,
@@ -143,14 +139,13 @@ class PrivacySoftwareAgent(BaseAgent):
                             title="Outdated JavaScript Library Detected",
                             description=f"Identified legacy jQuery version ({src}) with known vulnerabilities.",
                             affected_asset=context.target_url,
-                            evidence_ids=[ev_id],
+                            evidence_ids=[privacy_ev_id],
                             score_impact=3,
                         )
                     )
 
-            ev_id = uuid.uuid4()
             result.raw_evidence.append({
-                "evidence_id": ev_id,
+                "evidence_id": privacy_ev_id,
                 "kind": EvidenceKind.COOKIE_SET,
                 "cookie_count": len(cookies),
                 "header_count": len(normalized_headers),

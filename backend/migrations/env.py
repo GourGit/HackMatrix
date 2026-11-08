@@ -31,8 +31,10 @@ from app.models.base import Base
 import app.models  # load all models
 
 target_metadata = Base.metadata
-escaped_url = settings.database_url.replace("%", "%%")
-config.set_main_option("sqlalchemy.url", escaped_url)
+current_url = config.get_main_option("sqlalchemy.url")
+if not current_url or current_url.startswith("driver://"):
+    escaped_url = settings.database_url.replace("%", "%%")
+    config.set_main_option("sqlalchemy.url", escaped_url)
 
 # other values from the config, defined by the needs of env.py,
 # can be acquired:

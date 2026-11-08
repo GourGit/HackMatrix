@@ -13,10 +13,11 @@ import {
   Info
 } from 'lucide-react';
 import { createAssessment, getAssessment } from './api/client';
-import { AssessmentDetail, Finding } from './types';
+import { AssessmentDetail, Finding, CheckStatus } from './types';
 
 export default function App() {
   const [url, setUrl] = useState('');
+  const [cryptoScamEnabled, setCryptoScamEnabled] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [assessmentId, setAssessmentId] = useState<string | null>(null);
@@ -30,12 +31,12 @@ export default function App() {
       try {
         const data = await getAssessment(assessmentId);
         setAssessment(data);
-        if (data.status === 'completed' || data.status === 'partial' || data.status === 'failed') {
+        if (data.status === 'completed' || data.status === 'partial' || data.status === 'failed' || data.status === 'cancelled') {
           clearInterval(interval);
           setLoading(false);
         }
       } catch (err: any) {
-        setError(err.message);
+        setError(err.message || 'Failed to retrieve assessment details');
         clearInterval(interval);
         setLoading(false);
       }
@@ -58,10 +59,13 @@ export default function App() {
         url: formattedUrl,
         authorization: { attested: true },
         safeScan: { enabled: false },
+        options: {
+          cryptoScamAnalysis: cryptoScamEnabled,
+        },
       });
       setAssessmentId(res.assessmentId);
     } catch (err: any) {
-      setError(err.message);
+      setError(err.message || 'Failed to initialize security assessment');
       setLoading(false);
     }
   };
@@ -86,6 +90,69 @@ export default function App() {
       default:
         return 'bg-slate-800 text-slate-300 border-slate-700';
     }
+  };
+
+  const getAssessmentStatusBadge = (status: string) => {
+    switch (status) {
+      case 'completed':
+        return 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400';
+      case 'partial':
+        return 'bg-amber-500/10 border-amber-500/30 text-amber-400';
+      case 'running':
+        return 'bg-sky-500/10 border-sky-500/30 text-sky-400 animate-pulse';
+      case 'queued':
+        return 'bg-blue-500/10 border-blue-500/30 text-blue-400';
+      case 'failed':
+        return 'bg-rose-500/10 border-rose-500/30 text-rose-400';
+      default:
+        return 'bg-slate-800 border-slate-700 text-slate-400';
+    }
+  };
+
+  const getAgentStatus = (agentKey: string) => {
+    if (!assessment) return { label: 'Queued', color: 'text-slate-500' };
+    const run = assessment.agentRuns?.find(
+      (r) => r.agentName.toLowerCase() === agentKey.toLowerCase()
+    );
+    if (!run) {
+      if (assessment.status === 'queued') return { label: 'Queued', color: 'text-blue-400' };
+      if (assessment.status === 'running') return { label: 'Running...', color: 'text-sky-400' };
+      return { label: 'Not Executed', color: 'text-slate-500' };
+    }
+    switch (run.status) {
+      case 'completed':
+        return { label: 'Completed', color: 'text-emerald-400' };
+      case 'running':
+        return { label: 'Running...', color: 'text-sky-400' };
+      case 'partial':
+        return { label: 'Partial', color: 'text-amber-400' };
+      case 'failed':
+        return { label: 'Failed', color: 'text-rose-400' };
+      case 'unavailable':
+        return { label: 'Unavailable', color: 'text-slate-400' };
+      case 'timeout':
+        return { label: 'Timed Out', color: 'text-rose-400' };
+      case 'queued':
+      default:
+        return { label: 'Queued', color: 'text-blue-400' };
+    }
+  };
+
+  const getCheckBadge = (status?: CheckStatus) => {
+    if (!status || status === 'not_requested') {
+      return { label: 'Not Requested', class: 'bg-slate-800 text-slate-400 border-slate-700' };
+    }
+    if (status === 'passed' || status === 'good' || status === 'completed') {
+      return { label: status === 'good' ? 'Good' : 'Passed', class: 'bg-emerald-500/10 text-emerald-400 border-emerald-500/30' };
+    }
+    if (status === 'failed' || status === 'revoked') {
+      return { label: status === 'revoked' ? 'Revoked' : 'Failed', class: 'bg-rose-500/10 text-rose-400 border-rose-500/30' };
+    }
+    if (status === 'unavailable') {
+      return { label: 'Unavailable', class: 'bg-slate-800 text-slate-400 border-slate-700' };
+    }
+    // unknown - explicitly never passed
+    return { label: 'Unknown', class: 'bg-amber-500/10 text-amber-400 border-amber-500/30' };
   };
 
   return (
@@ -120,27 +187,42 @@ export default function App() {
             Assess target domains for phishing impersonation, TLS certificate weaknesses, redirect traps, and privacy exposures without intrusive exploitation.
           </p>
 
-          <form onSubmit={handleScan} className="flex flex-col sm:flex-row gap-2">
-            <div className="relative flex-1">
-              <div className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none text-slate-500">
-                <Globe className="w-5 h-5" />
+          <form onSubmit={handleScan} className="flex flex-col gap-3">
+            <div className="flex flex-col sm:flex-row gap-2">
+              <div className="relative flex-1">
+                <div className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none text-slate-500">
+                  <Globe className="w-5 h-5" />
+                </div>
+                <input
+                  type="text"
+                  placeholder="Enter URL to inspect (e.g. example.com or https://paypal-login-verify.com)"
+                  value={url}
+                  onChange={(e) => setUrl(e.target.value)}
+                  className="w-full pl-10 pr-4 py-3 bg-slate-900 border border-slate-700 rounded-lg text-white placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-emerald-500 focus:border-transparent text-sm"
+                />
               </div>
-              <input
-                type="text"
-                placeholder="Enter URL to inspect (e.g. example.com or https://paypal-login-verify.com)"
-                value={url}
-                onChange={(e) => setUrl(e.target.value)}
-                className="w-full pl-10 pr-4 py-3 bg-slate-900 border border-slate-700 rounded-lg text-white placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-emerald-500 focus:border-transparent text-sm"
-              />
+              <button
+                type="submit"
+                disabled={loading || !url}
+                className="px-6 py-3 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white font-medium rounded-lg text-sm transition flex items-center justify-center gap-2"
+              >
+                {loading ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Search className="w-4 h-4" />}
+                {loading ? 'Analyzing...' : 'Analyze Website'}
+              </button>
             </div>
-            <button
-              type="submit"
-              disabled={loading || !url}
-              className="px-6 py-3 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white font-medium rounded-lg text-sm transition flex items-center justify-center gap-2"
-            >
-              {loading ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Search className="w-4 h-4" />}
-              {loading ? 'Analyzing...' : 'Analyze Website'}
-            </button>
+
+            <div className="flex items-center justify-start gap-2 px-1 text-xs text-slate-400">
+              <input
+                type="checkbox"
+                id="cryptoScam"
+                checked={cryptoScamEnabled}
+                onChange={(e) => setCryptoScamEnabled(e.target.checked)}
+                className="rounded border-slate-700 text-emerald-500 focus:ring-emerald-500 bg-slate-900"
+              />
+              <label htmlFor="cryptoScam" className="cursor-pointer select-none">
+                Enable Cryptocurrency Scam Analysis (Disabled by default; runs only behind server flag)
+              </label>
+            </div>
           </form>
 
           {error && (
@@ -160,7 +242,7 @@ export default function App() {
                 <div>
                   <div className="flex items-center gap-2 mb-1">
                     <span className="text-xs uppercase px-2 py-0.5 rounded bg-slate-800 text-slate-400 font-mono">Target Domain</span>
-                    <span className={`text-xs uppercase px-2 py-0.5 rounded font-medium border ${assessment.status === 'completed' ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400' : 'bg-amber-500/10 border-amber-500/30 text-amber-400'}`}>
+                    <span className={`text-xs uppercase px-2 py-0.5 rounded font-medium border ${getAssessmentStatusBadge(assessment.status)}`}>
                       {assessment.status}
                     </span>
                   </div>
@@ -173,46 +255,83 @@ export default function App() {
                 </div>
 
                 {/* Score Dial */}
-                <div className={`flex items-center gap-3 px-4 py-2 rounded-xl border ${getScoreColor(assessment.risk.score)}`}>
+                <div className={`flex items-center gap-3 px-4 py-2 rounded-xl border ${getScoreColor(assessment.risk?.score ?? 0)}`}>
                   <div className="text-right">
                     <div className="text-xs font-semibold uppercase tracking-wider">Risk Score</div>
-                    <div className="text-xs capitalize opacity-80">{assessment.risk.band} Risk</div>
+                    <div className="text-xs capitalize opacity-80">{assessment.risk?.band ?? 'Low'} Risk</div>
                   </div>
-                  <div className="text-3xl font-black">{assessment.risk.score}</div>
+                  <div className="text-3xl font-black">{assessment.risk?.score ?? 0}</div>
                 </div>
               </div>
 
-              {/* Six Agent Grid Status */}
-              <div className="grid grid-cols-2 sm:grid-cols-3 gap-3 pt-6">
-                {[
-                  { name: 'URL & Redirect', icon: Globe, status: 'Completed' },
-                  { name: 'Phishing & Brand', icon: AlertTriangle, status: 'Completed' },
-                  { name: 'Certificate Intel', icon: Lock, status: 'Completed' },
-                  { name: 'Safe Surface', icon: Server, status: 'Allowlisted' },
-                  { name: 'Privacy & Cookies', icon: FileText, status: 'Completed' },
-                  { name: 'Threat Intel Feed', icon: Shield, status: 'Active' },
-                ].map((ag, i) => (
-                  <div key={i} className="p-3 bg-slate-950/60 border border-slate-800 rounded-lg flex items-center gap-3">
-                    <ag.icon className="w-4 h-4 text-emerald-400 flex-shrink-0" />
-                    <div className="overflow-hidden">
-                      <div className="text-xs font-medium text-slate-300 truncate">{ag.name}</div>
-                      <div className="text-[10px] text-slate-500">{ag.status}</div>
-                    </div>
-                  </div>
-                ))}
+              {/* Six Agent Grid Status — Live & Truthful */}
+              <div className="pt-6">
+                <h4 className="text-xs font-semibold uppercase tracking-wider text-slate-400 mb-3">Deterministic Agent Statuses</h4>
+                <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
+                  {[
+                    { key: 'url-redirect', name: 'URL & Redirect', icon: Globe },
+                    { key: 'phishing-brand', name: 'Phishing & Brand', icon: AlertTriangle },
+                    { key: 'certificate-intelligence', name: 'Certificate Intel', icon: Lock },
+                    { key: 'safe-surface', name: 'Safe Surface', icon: Server },
+                    { key: 'privacy-software', name: 'Privacy & Cookies', icon: FileText },
+                    { key: 'threat-intelligence', name: 'Threat Intel Feed', icon: Shield },
+                  ].map((ag, i) => {
+                    const st = getAgentStatus(ag.key);
+                    return (
+                      <div key={i} className="p-3 bg-slate-950/60 border border-slate-800 rounded-lg flex items-center gap-3">
+                        <ag.icon className="w-4 h-4 text-emerald-400 flex-shrink-0" />
+                        <div className="overflow-hidden">
+                          <div className="text-xs font-medium text-slate-300 truncate">{ag.name}</div>
+                          <div className={`text-[10px] font-mono font-medium ${st.color}`}>{st.label}</div>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
               </div>
+
+              {/* Truthful Security & Trust Checks */}
+              {assessment.checks && (
+                <div className="pt-6 border-t border-slate-800/80 mt-6">
+                  <h4 className="text-xs font-semibold uppercase tracking-wider text-slate-400 mb-3">Security & Trust Checks</h4>
+                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5">
+                    {[
+                      { key: 'ct', name: 'Cert Transparency', status: assessment.checks.ct },
+                      { key: 'revocation', name: 'Revocation (OCSP/CRL)', status: assessment.checks.revocation },
+                      { key: 'safeScan', name: 'Safe Surface Scan', status: assessment.checks.safeScan },
+                      { key: 'caChain', name: 'Trusted CA Chain', status: assessment.checks.caChain },
+                      { key: 'hostnameMatch', name: 'Hostname / SAN', status: assessment.checks.hostnameMatch },
+                      { key: 'validityDates', name: 'Validity Period', status: assessment.checks.validityDates },
+                      { key: 'tlsConfiguration', name: 'TLS Version & Cipher', status: assessment.checks.tlsConfiguration },
+                      { key: 'cryptoStrength', name: 'Cryptographic Strength', status: assessment.checks.cryptoStrength },
+                    ].map((chk, idx) => {
+                      const badge = getCheckBadge(chk.status);
+                      return (
+                        <div key={idx} className="p-2.5 bg-slate-950/40 border border-slate-800/80 rounded-lg flex flex-col justify-between">
+                          <span className="text-[11px] text-slate-400 font-medium truncate mb-1">{chk.name}</span>
+                          <span className={`text-[10px] uppercase font-mono px-1.5 py-0.5 rounded border inline-block w-fit ${badge.class}`}>
+                            {badge.label}
+                          </span>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
             </div>
 
             {/* Findings Section */}
             <div className="bg-slate-900/80 border border-slate-800 rounded-xl p-6 shadow-xl">
               <h3 className="text-lg font-bold text-white mb-4 flex items-center gap-2">
                 <Info className="w-5 h-5 text-emerald-400" />
-                Security & Trust Findings ({assessment.findings.length})
+                Security & Trust Findings ({assessment.findings?.length ?? 0})
               </h3>
 
-              {assessment.findings.length === 0 ? (
+              {!assessment.findings || assessment.findings.length === 0 ? (
                 <div className="text-center py-8 text-slate-500 text-sm">
-                  No high-risk indicators or malicious signals detected on this target.
+                  {assessment.status === 'running' || assessment.status === 'queued'
+                    ? 'Assessment in progress — awaiting agent findings...'
+                    : 'No high-risk indicators or malicious signals detected on this target.'}
                 </div>
               ) : (
                 <div className="space-y-3">
@@ -245,4 +364,3 @@ export default function App() {
     </div>
   );
 }
-

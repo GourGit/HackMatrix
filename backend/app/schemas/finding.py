@@ -11,11 +11,12 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.schemas.common import (
     AgentName,
     FindingStatus,
+    ReviewDecision,
     Severity,
 )
 
@@ -146,12 +147,14 @@ class FindingReviewRequest(BaseModel):
         alias_generator=_to_camel,
     )
 
-    status: FindingStatus = Field(
-        ...,
-        description=(
-            "New review status. Must be one of: "
-            "accepted, disputed, false_positive."
-        ),
+    decision: ReviewDecision | None = Field(
+        None,
+        description="Constrained review decision: accepted, disputed, or false_positive.",
+        examples=["accepted"],
+    )
+    status: ReviewDecision | None = Field(
+        None,
+        description="Alias for decision: accepted, disputed, or false_positive.",
         examples=["accepted"],
     )
     rationale: str = Field(
@@ -161,6 +164,26 @@ class FindingReviewRequest(BaseModel):
         description="Analyst explanation for the review decision.",
         examples=["Confirmed via independent OCSP responder check."],
     )
+
+    @field_validator("rationale")
+    @classmethod
+    def validate_rationale_not_blank(cls, v: str) -> str:
+        trimmed = (v or "").strip()
+        if not trimmed:
+            raise ValueError("Rationale cannot be blank or whitespace-only.")
+        return trimmed
+
+    @model_validator(mode="after")
+    def validate_decision_or_status(self) -> FindingReviewRequest:
+        if self.decision is None and self.status is None:
+            raise ValueError("Either 'decision' or 'status' must be provided.")
+        if self.decision is not None and self.status is not None and self.decision != self.status:
+            raise ValueError("When both 'decision' and 'status' are provided, they must match.")
+        if self.decision is None:
+            self.decision = self.status
+        elif self.status is None:
+            self.status = self.decision
+        return self
 
 
 class FindingReviewResponse(BaseModel):
@@ -174,18 +197,35 @@ class FindingReviewResponse(BaseModel):
 
     finding_id: uuid.UUID = Field(
         ...,
+        alias="findingId",
         description="Finding that was reviewed.",
     )
-    status: FindingStatus = Field(
+    status: str = Field(
         ...,
         description="Updated review status.",
         examples=["accepted"],
     )
+    decision: str | None = Field(
+        None,
+        description="Review decision.",
+        examples=["accepted"],
+    )
     reviewed_at: datetime = Field(
         ...,
+        alias="reviewedAt",
         description="ISO-8601 UTC timestamp of the review.",
     )
-    reviewed_by: str = Field(
+    reviewer_id: uuid.UUID = Field(
         ...,
+        alias="reviewerId",
+        description="UUID of the analyst who performed the review.",
+    )
+    reviewed_by: str | None = Field(
+        None,
+        alias="reviewedBy",
         description="Identifier of the analyst who performed the review.",
+    )
+    rationale: str = Field(
+        ...,
+        description="Analyst explanation for the review decision.",
     )

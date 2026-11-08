@@ -31,6 +31,7 @@ class ThreatIntelAgent(BaseAgent):
 
         parsed = urlparse(context.target_url)
         hostname = parsed.hostname or context.target_url
+        ti_ev_id = uuid.uuid4()
 
         # Check configured reputation feeds
         # 1. Google Safe Browsing Lookup (if API key available)
@@ -53,7 +54,6 @@ class ThreatIntelAgent(BaseAgent):
                         data = resp.json()
                         matches = data.get("matches", [])
                         if matches:
-                            ev_id = uuid.uuid4()
                             result.findings.append(
                                 self.create_finding(
                                     context=context,
@@ -63,7 +63,7 @@ class ThreatIntelAgent(BaseAgent):
                                     title="Flagged by Google Safe Browsing Feed",
                                     description=f"Target URL is cataloged as dangerous: {matches[0].get('threatType')}.",
                                     affected_asset=context.target_url,
-                                    evidence_ids=[ev_id],
+                                    evidence_ids=[ti_ev_id],
                                     score_impact=40,
                                 )
                             )
@@ -75,7 +75,6 @@ class ThreatIntelAgent(BaseAgent):
         # Suspicious TLD check
         suspicious_tlds = [".tk", ".ml", ".ga", ".cf", ".gq", ".top", ".xyz", ".buzz", ".work"]
         if any(hostname.endswith(tld) for tld in suspicious_tlds):
-            ev_id = uuid.uuid4()
             result.findings.append(
                 self.create_finding(
                     context=context,
@@ -85,14 +84,13 @@ class ThreatIntelAgent(BaseAgent):
                     title="Domain Registered Under High-Abuse Top-Level Domain",
                     description=f"The domain {hostname} uses a top-level domain frequently associated with automated throwaway phishing campaigns.",
                     affected_asset=hostname,
-                    evidence_ids=[ev_id],
+                    evidence_ids=[ti_ev_id],
                     score_impact=8,
                 )
             )
 
-        ev_id = uuid.uuid4()
         result.raw_evidence.append({
-            "evidence_id": ev_id,
+            "evidence_id": ti_ev_id,
             "kind": EvidenceKind.PROVIDER_RESULT,
             "correlations": "checked",
         })

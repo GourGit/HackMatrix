@@ -272,6 +272,47 @@ class ChecksDetail(BaseModel):
         description="Safe surface scan result.",
         examples=["not_requested"],
     )
+    hostname_match: Optional[CheckAvailability] = Field(
+        default=None,
+        description="Certificate hostname / SAN matching result.",
+        examples=["passed"],
+    )
+    validity_dates: Optional[CheckAvailability] = Field(
+        default=None,
+        description="Certificate validity dates result.",
+        examples=["passed"],
+    )
+    ca_chain: Optional[CheckAvailability] = Field(
+        default=None,
+        description="Trusted CA chain validation result.",
+        examples=["passed"],
+    )
+    tls_configuration: Optional[CheckAvailability] = Field(
+        default=None,
+        description="TLS protocol version and cipher suite evaluation.",
+        examples=["passed"],
+    )
+    crypto_strength: Optional[CheckAvailability] = Field(
+        default=None,
+        description="Key size and signature algorithm strength.",
+        examples=["passed"],
+    )
+
+
+class AgentRunSummary(BaseModel):
+    """Execution status summary for an agent run."""
+
+    model_config = ConfigDict(
+        from_attributes=True,
+        populate_by_name=True,
+        alias_generator=_to_camel,
+    )
+
+    agent_name: str = Field(..., alias="agentName", description="Agent name identifier.")
+    status: str = Field(..., description="Agent run status.")
+    started_at: datetime | None = Field(None, alias="startedAt", description="Run start timestamp.")
+    ended_at: datetime | None = Field(None, alias="endedAt", description="Run completion timestamp.")
+    error_code: str | None = Field(None, alias="errorCode", description="Optional error classification.")
 
 
 class AssessmentDetailResponse(BaseModel):
@@ -321,4 +362,9 @@ class AssessmentDetailResponse(BaseModel):
     checks: ChecksDetail | None = Field(
         None,
         description="Per-check availability flags.",
+    )
+    agent_runs: list[AgentRunSummary] = Field(
+        default_factory=list,
+        alias="agentRuns",
+        description="Execution status per deterministic agent.",
     )

@@ -10,7 +10,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from fastapi import APIRouter, Depends, Path, Response, status
+from fastapi import APIRouter, Depends, Path, Request, Response, status
 from fastapi.responses import JSONResponse, StreamingResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -34,6 +34,7 @@ _LINK_TTL_MINUTES = 15
 )
 @limiter.limit("30/minute")
 async def get_evidence(
+    request: Request,
     evidence_id: uuid.UUID = Path(..., description="Evidence UUID"),
     *,
     db: AsyncSession = Depends(get_db),
@@ -45,18 +46,22 @@ async def get_evidence(
     Caller must belong to the tenant owning the parent assessment.
     """
     stmt = (
-        select(Evidence)
-        .join(Assessment, Evidence.assessment_id == Assessment.id)
-        .where(
-            Evidence.id == evidence_id,
-            Assessment.tenant_id == identity.tenant_id,
-        )
+        select(Evidence, Assessment)
+        .outerjoin(Assessment, Evidence.assessment_id == Assessment.id)
+        .where(Evidence.id == evidence_id)
     )
     result = await db.execute(stmt)
-    evidence = result.scalar_one_or_none()
+    row = result.first()
 
-    if evidence is None:
+    if row is None:
         raise NotFoundError("Evidence", detail=str(evidence_id))
+
+    evidence, assessment = row
+    if assessment is None or (assessment.tenant_id != identity.tenant_id and not identity.is_admin):
+        raise EvidenceForbiddenError("Access to this evidence is not authorized.")
+
+    if evidence.retention_until and datetime.now(timezone.utc) > evidence.retention_until:
+        raise NotFoundError("Evidence", detail="Evidence has expired per retention policy.")
 
     expires = datetime.now(timezone.utc) + timedelta(minutes=_LINK_TTL_MINUTES)
 
@@ -83,6 +88,7 @@ async def get_evidence(
 )
 @limiter.limit("20/minute")
 async def download_evidence_artifact(
+    request: Request,
     evidence_id: uuid.UUID = Path(..., description="Evidence UUID"),
     *,
     db: AsyncSession = Depends(get_db),
@@ -90,31 +96,31 @@ async def download_evidence_artifact(
 ) -> Response:
     """Stream authorized, redacted artifact blob from storage."""
     stmt = (
-        select(Evidence)
-        .join(Assessment, Evidence.assessment_id == Assessment.id)
-        .where(
-            Evidence.id == evidence_id,
-            Assessment.tenant_id == identity.tenant_id,
-        )
+        select(Evidence, Assessment)
+        .outerjoin(Assessment, Evidence.assessment_id == Assessment.id)
+        .where(Evidence.id == evidence_id)
     )
     result = await db.execute(stmt)
-    evidence = result.scalar_one_or_none()
+    row = result.first()
 
-    if evidence is None:
+    if row is None:
         raise NotFoundError("Evidence artifact", detail=str(evidence_id))
+
+    evidence, assessment = row
+    if assessment is None or (assessment.tenant_id != identity.tenant_id and not identity.is_admin):
+        raise EvidenceForbiddenError("Access to this evidence is not authorized.")
 
     # Check retention expiry if set
     if evidence.retention_until and datetime.now(timezone.utc) > evidence.retention_until:
-        raise NotFoundError("Evidence artifact has expired per retention policy.")
+        raise NotFoundError("Evidence artifact", detail="Evidence artifact has expired per retention policy.")
 
     store = EvidenceStore()
     content_bytes = await store.retrieve(evidence.content_hash)
     if content_bytes is None:
-        # Fallback metadata representation if raw storage ref is empty
-        content_bytes = f'{{"evidenceId": "{evidence.id}", "kind": "{evidence.kind}", "redacted": true}}'.encode()
+        raise NotFoundError("Evidence artifact", detail="Evidence content not found in storage.")
 
-    return StreamingResponse(
-        io.BytesIO(content_bytes),
+    return Response(
+        content=content_bytes,
         media_type="application/json",
         headers={
             "Content-Disposition": f'attachment; filename="evidence-{evidence_id}.json"',

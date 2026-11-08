@@ -30,6 +30,7 @@ class UrlRedirectAgent(BaseAgent):
         current_url = context.target_url
         hops = []
         max_hops = 10
+        trace_ev_id = uuid.uuid4()
 
         try:
             for hop_idx in range(max_hops):
@@ -73,7 +74,6 @@ class UrlRedirectAgent(BaseAgent):
 
                     # Detect HTTPS downgrade
                     if current_url.startswith("https://") and next_url.startswith("http://"):
-                        ev_id = uuid.uuid4()
                         result.findings.append(
                             self.create_finding(
                                 context=context,
@@ -83,7 +83,7 @@ class UrlRedirectAgent(BaseAgent):
                                 title="HTTPS to HTTP Downgrade Redirect Detected",
                                 description=f"Redirect chain downgraded from secure HTTPS ({current_url}) to unencrypted HTTP ({next_url}).",
                                 affected_asset=current_url,
-                                evidence_ids=[ev_id],
+                                evidence_ids=[trace_ev_id],
                                 score_impact=20,
                             )
                         )
@@ -91,7 +91,6 @@ class UrlRedirectAgent(BaseAgent):
                     # Detect cross-domain hop
                     next_host = urlparse(next_url).hostname
                     if next_host and next_host != hostname:
-                        ev_id = uuid.uuid4()
                         result.findings.append(
                             self.create_finding(
                                 context=context,
@@ -101,7 +100,7 @@ class UrlRedirectAgent(BaseAgent):
                                 title="Cross-Domain Redirect Observed",
                                 description=f"Redirect jumped to an external domain: {hostname} -> {next_host}.",
                                 affected_asset=current_url,
-                                evidence_ids=[ev_id],
+                                evidence_ids=[trace_ev_id],
                                 score_impact=3,
                             )
                         )
@@ -110,7 +109,6 @@ class UrlRedirectAgent(BaseAgent):
                 else:
                     break
             else:
-                ev_id = uuid.uuid4()
                 result.findings.append(
                     self.create_finding(
                         context=context,
@@ -120,14 +118,13 @@ class UrlRedirectAgent(BaseAgent):
                         title="Excessive Redirect Chain",
                         description=f"Redirect chain exceeded maximum limit of {max_hops} hops.",
                         affected_asset=context.target_url,
-                        evidence_ids=[ev_id],
+                        evidence_ids=[trace_ev_id],
                         score_impact=8,
                     )
                 )
 
-            ev_id = uuid.uuid4()
             result.raw_evidence.append({
-                "evidence_id": ev_id,
+                "evidence_id": trace_ev_id,
                 "kind": EvidenceKind.HTTP_RESPONSE,
                 "hops": hops,
                 "final_url": current_url,

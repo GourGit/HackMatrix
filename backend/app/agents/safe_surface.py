@@ -42,6 +42,7 @@ class SafeSurfaceAgent(BaseAgent):
         # Strictly inspect only authorized ports; never broad default
         allowed_ports = list(context.safe_scan_ports) if context.safe_scan_ports is not None else []
         observed_services = []
+        surf_ev_id = uuid.uuid4()
 
         for port in allowed_ports:
             try:
@@ -55,7 +56,6 @@ class SafeSurfaceAgent(BaseAgent):
 
                     # Flag sensitive management ports if exposed
                     if port in (8080, 8443, 8888, 9000):
-                        ev_id = uuid.uuid4()
                         result.findings.append(
                             self.create_finding(
                                 context=context,
@@ -65,7 +65,7 @@ class SafeSurfaceAgent(BaseAgent):
                                 title=f"Non-Standard Service Port Exposed (Port {port})",
                                 description=f"Port {port} is open and responding to connections. Administrative/alternative services should not be publicly accessible.",
                                 affected_asset=f"{hostname}:{port}",
-                                evidence_ids=[ev_id],
+                                evidence_ids=[surf_ev_id],
                                 score_impact=8,
                             )
                         )
@@ -79,7 +79,6 @@ class SafeSurfaceAgent(BaseAgent):
             server_hdr = head_resp.headers.get("server")
             if server_hdr:
                 if any(legacy in server_hdr.lower() for legacy in ["apache/2.2", "nginx/1.10", "php/5.", "iis/7."]):
-                    ev_id = uuid.uuid4()
                     result.findings.append(
                         self.create_finding(
                             context=context,
@@ -89,16 +88,15 @@ class SafeSurfaceAgent(BaseAgent):
                             title=f"Potentially Obsolete Server Software ({server_hdr})",
                             description=f"The web server exposes an end-of-life or outdated version banner: {server_hdr}.",
                             affected_asset=context.target_url,
-                            evidence_ids=[ev_id],
+                            evidence_ids=[surf_ev_id],
                             score_impact=8,
                         )
                     )
         except Exception:
             pass
 
-        ev_id = uuid.uuid4()
         result.raw_evidence.append({
-            "evidence_id": ev_id,
+            "evidence_id": surf_ev_id,
             "kind": EvidenceKind.BANNER,
             "services": observed_services,
         })

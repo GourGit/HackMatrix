@@ -19,6 +19,7 @@ Core Security Invariants:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import ipaddress
 import socket
 import ssl
@@ -54,7 +55,7 @@ class SafeHttpResponse:
 
 @dataclass(frozen=True)
 class SafeTlsObservation:
-    """Passive TLS inspection results obtained through verified IP pinning."""
+    """Passive and active TLS inspection results obtained through verified IP pinning."""
     hostname: str
     peer_ip: str
     port: int
@@ -69,6 +70,14 @@ class SafeTlsObservation:
     key_size: Optional[int] = None
     raw_der: bytes = b""
     key_type: Optional[str] = None
+    sha256_fingerprint: str = ""
+    signature_algorithm: str = ""
+    trusted_chain: bool = False
+    chain_status: str = "unknown"  # "passed", "failed", "unknown", "unavailable"
+    chain_error: Optional[str] = None
+    ocsp_urls: List[str] = field(default_factory=list)
+    crl_urls: List[str] = field(default_factory=list)
+    revocation_status: str = "unknown"  # "passed", "failed", "unknown", "unavailable", "not_requested"
 
 
 class SafeEgressLayer:
@@ -251,6 +260,10 @@ class SafeEgressLayer:
 
                 cert = x509.load_der_x509_certificate(der_cert, default_backend())
 
+                subject = cert.subject.rfc4514_string()
+                issuer = cert.issuer.rfc4514_string()
+                sha256_fingerprint = hashlib.sha256(der_cert).hexdigest()
+
                 sans = []
                 try:
                     ext = cert.extensions.get_extension_for_oid(x509.ExtensionOID.SUBJECT_ALTERNATIVE_NAME)
@@ -291,22 +304,82 @@ class SafeEgressLayer:
                 except Exception:
                     pass
 
-                return SafeTlsObservation(
-                    hostname=hostname,
-                    peer_ip=target_ip,
-                    port=port,
-                    subject=cert.subject.rfc4514_string(),
-                    issuer=cert.issuer.rfc4514_string(),
-                    not_before=cert.not_valid_before_utc,
-                    not_after=cert.not_valid_after_utc,
-                    san_list=sans,
-                    has_sct=has_sct,
-                    tls_version=tls_version,
-                    cipher_name=cipher[0] if cipher else "UNKNOWN",
-                    key_size=key_size,
-                    raw_der=der_cert,
-                    key_type=key_type,
-                )
+                sig_algo = ""
+                try:
+                    sig_algo = cert.signature_algorithm_oid._name
+                except Exception:
+                    pass
+
+                ocsp_urls: list[str] = []
+                try:
+                    aia = cert.extensions.get_extension_for_oid(x509.ExtensionOID.AUTHORITY_INFORMATION_ACCESS)
+                    for desc in aia.value:
+                        if desc.access_method == x509.AuthorityInformationAccessOID.OCSP:
+                            ocsp_urls.append(str(desc.access_location.value))
+                except Exception:
+                    pass
+
+                crl_urls: list[str] = []
+                try:
+                    crl_ext = cert.extensions.get_extension_for_oid(x509.ExtensionOID.CRL_DISTRIBUTION_POINTS)
+                    for dp in crl_ext.value:
+                        if dp.full_name:
+                            for name in dp.full_name:
+                                crl_urls.append(str(name.value))
+                except Exception:
+                    pass
+
+        # 2. Separate trusted CA chain validation from passive observation
+        trusted_chain = False
+        chain_status = "unknown"
+        chain_error = None
+        try:
+            trusted_ctx = ssl.create_default_context()
+            trusted_ctx.check_hostname = False
+            trusted_ctx.verify_mode = ssl.CERT_REQUIRED
+            with socket.create_connection((target_ip, port), timeout=min(self.timeout, 4.0)) as tsock:
+                with trusted_ctx.wrap_socket(tsock, server_hostname=hostname) as tssock:
+                    trusted_chain = True
+                    chain_status = "passed"
+        except ssl.SSLCertVerificationError as e:
+            trusted_chain = False
+            chain_status = "failed"
+            chain_error = str(e)
+        except Exception as e:
+            trusted_chain = False
+            chain_status = "unavailable"
+            chain_error = str(e)
+
+        # 3. Revocation status
+        if not ocsp_urls and not crl_urls:
+            revocation_status = "unavailable"
+        else:
+            revocation_status = "unknown"
+
+        return SafeTlsObservation(
+            hostname=hostname,
+            peer_ip=target_ip,
+            port=port,
+            subject=subject,
+            issuer=issuer,
+            not_before=cert.not_valid_before_utc,
+            not_after=cert.not_valid_after_utc,
+            san_list=sans,
+            has_sct=has_sct,
+            tls_version=tls_version,
+            cipher_name=cipher[0] if cipher else "UNKNOWN",
+            key_size=key_size,
+            raw_der=der_cert,
+            key_type=key_type,
+            sha256_fingerprint=sha256_fingerprint,
+            signature_algorithm=sig_algo,
+            trusted_chain=trusted_chain,
+            chain_status=chain_status,
+            chain_error=chain_error,
+            ocsp_urls=ocsp_urls,
+            crl_urls=crl_urls,
+            revocation_status=revocation_status,
+        )
 
     async def probe_tcp_port(
         self,

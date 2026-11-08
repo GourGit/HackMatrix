@@ -1,56 +1,47 @@
 """Indicator endpoints — submit and query threat indicators.
 
 Indicators are community- or tenant-contributed observables (URLs,
-domains, IPs, hashes, …) enriched with confidence and provenance.
+domains, IPs, hashes, emails, certificate fingerprints) enriched with
+confidence and provenance.
 """
 
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
-from typing import Any, Optional
-from urllib.parse import urlparse
+from typing import Optional
 
-from fastapi import APIRouter, Depends, Query, status
+from fastapi import APIRouter, Depends, Request, status
 from fastapi.responses import JSONResponse
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import AuthenticatedIdentity, get_current_identity, get_db, get_request_id
-from app.core.errors import ErrorCode, EvidenceForbiddenError, NotFoundError, TrustLensError
+from app.core.errors import EvidenceForbiddenError
+from app.core.indicator_normalizer import normalize_indicator_value
 from app.middleware.rate_limit import limiter
 from app.models.assessment import Assessment
 from app.models.evidence import Evidence
 from app.models.indicator import Indicator
 from app.schemas.common import IndicatorType, ReviewStatus, SharingPolicy
-from app.schemas.indicator import CreateIndicatorRequest
+from app.schemas.indicator import (
+    CreateIndicatorRequest,
+    CreateIndicatorResponse,
+    IndicatorListResponse,
+    IndicatorQueryParams,
+)
 
 router = APIRouter(prefix="/indicators", tags=["indicators"])
-
-
-def normalize_indicator_value(val: str, ind_type: IndicatorType) -> str:
-    """Normalize indicator value for deduplication and matching."""
-    s = val.strip()
-    if ind_type in (IndicatorType.DOMAIN, IndicatorType.EMAIL):
-        return s.lower()
-    elif ind_type == IndicatorType.URL:
-        parsed = urlparse(s)
-        scheme = parsed.scheme.lower()
-        netloc = parsed.netloc.lower()
-        return f"{scheme}://{netloc}{parsed.path}" if parsed.netloc else s
-    elif ind_type in (IndicatorType.HASH, IndicatorType.CERTIFICATE_FINGERPRINT):
-        return s.lower().replace(":", "").replace(" ", "")
-    return s
 
 
 @router.post(
     "",
     summary="Submit a new indicator",
     status_code=status.HTTP_201_CREATED,
-    response_class=JSONResponse,
+    response_model=CreateIndicatorResponse,
 )
 @limiter.limit("10/minute")
 async def create_indicator(
+    request: Request,
     payload: CreateIndicatorRequest,
     *,
     db: AsyncSession = Depends(get_db),
@@ -61,38 +52,79 @@ async def create_indicator(
 
     Validates that submitted evidence exists and belongs to the authenticated tenant.
     Normalizes the indicator value and begins in pending_review status.
+    Deduplicates existing tenant indicators.
     """
     tenant_id = identity.tenant_id
 
-    # Validate supporting evidence existence and tenant ownership
-    primary_evidence_id = None
+    # 1. Validate supporting evidence existence and tenant ownership
+    ids_to_check: list[uuid.UUID] = []
+    if payload.source_evidence_id:
+        ids_to_check.append(payload.source_evidence_id)
     if payload.evidence_ids:
-        for ev_id in payload.evidence_ids:
-            stmt = select(Evidence).join(Assessment, Evidence.assessment_id == Assessment.id).where(
-                Evidence.id == ev_id,
-                Assessment.tenant_id == tenant_id,
-            )
-            res = await db.execute(stmt)
-            evidence = res.scalar_one_or_none()
-            if not evidence:
-                raise TrustLensError(
-                    code=ErrorCode.EVIDENCE_FORBIDDEN,
-                    message=f"Evidence {ev_id} not found or access denied.",
-                    status_code=403,
-                )
+        for eid in payload.evidence_ids:
+            if eid not in ids_to_check:
+                ids_to_check.append(eid)
+
+    primary_evidence_id: uuid.UUID | None = payload.source_evidence_id
+    if ids_to_check:
+        stmt = (
+            select(Evidence, Assessment)
+            .outerjoin(Assessment, Evidence.assessment_id == Assessment.id)
+            .where(Evidence.id.in_(ids_to_check))
+        )
+        res = await db.execute(stmt)
+        rows = res.all()
+        if len(rows) != len(ids_to_check):
+            raise EvidenceForbiddenError("One or more evidence IDs not found or access denied.")
+        for evidence, assessment in rows:
+            if assessment is None or (assessment.tenant_id != tenant_id and not identity.is_admin):
+                raise EvidenceForbiddenError(f"Evidence {evidence.id} not found or access denied.")
             if primary_evidence_id is None:
                 primary_evidence_id = evidence.id
 
+    # 2. Canonical normalization
     norm_val = normalize_indicator_value(payload.value, payload.type)
+    ind_type_str = payload.type.value if hasattr(payload.type, "value") else str(payload.type)
+    sharing_policy_str = (
+        payload.sharing_policy.value
+        if hasattr(payload.sharing_policy, "value")
+        else str(payload.sharing_policy)
+    )
 
+    # 3. Duplicate handling
+    stmt_dup = select(Indicator).where(
+        Indicator.tenant_id == tenant_id,
+        Indicator.type == ind_type_str,
+        Indicator.value_normalized == norm_val,
+    )
+    res_dup = await db.execute(stmt_dup)
+    existing = res_dup.scalar_one_or_none()
+    if existing:
+        # Deduplicate: update confidence if higher, link evidence if previously absent
+        if payload.confidence > existing.confidence:
+            existing.confidence = payload.confidence
+        if primary_evidence_id and not existing.source_evidence_id:
+            existing.source_evidence_id = primary_evidence_id
+        await db.commit()
+        return JSONResponse(
+            status_code=status.HTTP_200_OK,
+            content={
+                "indicatorId": str(existing.id),
+                "status": existing.review_status,
+                "isDuplicate": True,
+            },
+            headers={"X-Request-ID": request_id},
+        )
+
+    # 4. Insert new indicator (always starts in pending_review)
     indicator_id = uuid.uuid4()
     indicator = Indicator(
         id=indicator_id,
         tenant_id=tenant_id,
-        type=payload.type.value,
+        type=ind_type_str,
         value_normalized=norm_val,
         confidence=payload.confidence,
-        sharing_policy=payload.sharing_policy.value,
+        sharing_policy=sharing_policy_str,
         review_status=ReviewStatus.PENDING_REVIEW.value,
         source_evidence_id=primary_evidence_id,
     )
@@ -104,6 +136,7 @@ async def create_indicator(
         content={
             "indicatorId": str(indicator_id),
             "status": ReviewStatus.PENDING_REVIEW.value,
+            "isDuplicate": False,
         },
         headers={"X-Request-ID": request_id},
     )
@@ -112,15 +145,13 @@ async def create_indicator(
 @router.get(
     "",
     summary="Query indicators",
-    response_class=JSONResponse,
+    response_model=IndicatorListResponse,
 )
 @limiter.limit("30/minute")
 async def list_indicators(
+    request: Request,
+    params: IndicatorQueryParams = Depends(),
     *,
-    value: Optional[str] = Query(None, description="Observable value to search"),
-    type: Optional[str] = Query(None, alias="type", description="Indicator type"),
-    page: int = Query(1, ge=1, description="Page number"),
-    page_size: int = Query(20, ge=1, le=100, description="Items per page"),
     db: AsyncSession = Depends(get_db),
     request_id: str = Depends(get_request_id),
     identity: AuthenticatedIdentity = Depends(get_current_identity),
@@ -128,31 +159,55 @@ async def list_indicators(
     """Return tenant-visible, provenance-labelled indicators.
 
     Non-tenant private/tenant indicators are strictly hidden.
-    Community indicators are visible only if reviewed or owned by the tenant.
+    Community indicators from other tenants are visible only if reviewed.
     """
     tenant_id = identity.tenant_id
 
-    stmt = select(Indicator).where(
-        (Indicator.tenant_id == tenant_id)
-        | (
-            (Indicator.sharing_policy == SharingPolicy.COMMUNITY.value)
-            & (Indicator.review_status == ReviewStatus.REVIEWED.value)
-        )
+    # Base visibility gate
+    visibility_filter = (Indicator.tenant_id == tenant_id) | (
+        (Indicator.sharing_policy == SharingPolicy.COMMUNITY.value)
+        & (Indicator.review_status == ReviewStatus.REVIEWED.value)
     )
+    stmt = select(Indicator).where(visibility_filter)
 
-    if value is not None:
-        stmt = stmt.where(Indicator.value_normalized == value.strip().lower())
-    if type is not None:
-        stmt = stmt.where(Indicator.type == type)
+    # Filter by sharing policy
+    if params.sharing_policy is not None:
+        policy_str = (
+            params.sharing_policy.value
+            if hasattr(params.sharing_policy, "value")
+            else str(params.sharing_policy)
+        )
+        stmt = stmt.where(Indicator.sharing_policy == policy_str)
 
-    # Total count for pagination metadata.
+    # Filter by type
+    if params.type is not None:
+        type_str = params.type.value if hasattr(params.type, "value") else str(params.type)
+        stmt = stmt.where(Indicator.type == type_str)
+
+    # Filter by value
+    if params.value is not None:
+        if params.type is not None:
+            search_val = normalize_indicator_value(params.value, params.type)
+            stmt = stmt.where(Indicator.value_normalized == search_val)
+        else:
+            candidates = {params.value.strip(), params.value.strip().lower()}
+            for itype in IndicatorType:
+                try:
+                    candidates.add(normalize_indicator_value(params.value, itype))
+                except Exception:
+                    pass
+            stmt = stmt.where(Indicator.value_normalized.in_(list(candidates)))
+
+    # Total count for pagination metadata
     count_stmt = select(func.count()).select_from(stmt.subquery())
     total = (await db.execute(count_stmt)).scalar_one()
 
-    # Apply pagination.
-    offset = (page - 1) * page_size
-    stmt = stmt.order_by(Indicator.created_at.desc()).offset(offset).limit(page_size)
+    # Pagination calculation
+    limit = params.limit if params.limit is not None else params.page_size
+    offset = params.offset if params.offset is not None else (params.page - 1) * limit
+    page = (offset // limit) + 1 if limit > 0 else 1
 
+    stmt = stmt.order_by(Indicator.created_at.desc()).offset(offset).limit(limit)
     result = await db.execute(stmt)
     indicators = result.scalars().all()
 
@@ -165,7 +220,10 @@ async def list_indicators(
             "sharingPolicy": ind.sharing_policy,
             "reviewStatus": ind.review_status,
             "sourceEvidenceId": str(ind.source_evidence_id) if ind.source_evidence_id else None,
+            "evidenceIds": [str(ind.source_evidence_id)] if ind.source_evidence_id else [],
             "createdAt": ind.created_at.isoformat(),
+            "tenantId": str(ind.tenant_id),
+            "source": getattr(ind, "source", None),
         }
         for ind in indicators
     ]
@@ -176,7 +234,7 @@ async def list_indicators(
             "items": items,
             "total": total,
             "page": page,
-            "pageSize": page_size,
+            "pageSize": limit,
         },
         headers={"X-Request-ID": request_id},
     )

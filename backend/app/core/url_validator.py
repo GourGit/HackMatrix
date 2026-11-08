@@ -13,7 +13,7 @@ must never be forwarded directly.
 from __future__ import annotations
 
 import dataclasses
-import re
+import ipaddress
 import urllib.parse
 from typing import Final
 
@@ -164,11 +164,15 @@ def _normalize_hostname(hostname: str) -> str:
     Raises:
         InvalidURLError: If the hostname is not a valid IDNA label.
     """
-    # Strip surrounding brackets from IPv6 literals like ``[::1]``.
-    if hostname.startswith("[") and hostname.endswith("]"):
-        # Return the IPv6 literal as-is (lowercased); IP validation
-        # happens later in the safety module.
-        return hostname.lower()
+    # Handle IP address literals (IPv4 or bracketed/unbracketed IPv6)
+    clean_ip = hostname.strip("[]")
+    try:
+        addr = ipaddress.ip_address(clean_ip)
+        if isinstance(addr, ipaddress.IPv6Address):
+            return f"[{addr.compressed.lower()}]"
+        return addr.compressed.lower()
+    except ValueError:
+        pass
 
     try:
         # idna.encode returns bytes; decode back to str.

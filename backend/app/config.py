@@ -6,11 +6,50 @@ prefixed with VITE_ or any frontend-exposed prefix.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import List
+from urllib.parse import urlsplit
 
-from pydantic import field_validator
+from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+_INSECURE_APP_SECRETS = {
+    "change-me-to-a-random-secret",
+    "secret",
+    "changeme",
+    "default",
+    "password",
+    "admin",
+    "test",
+    "development",
+}
+
+_KNOWN_PLACEHOLDER_PREFIXES = (
+    "replace-with-",
+    "your-",
+    "change-me-",
+    "placeholder-",
+    "example-",
+    "test-",
+    "my-",
+)
+
+_DEFAULT_DATABASE_PATTERNS = [
+    ":trustlens@",
+    ":trustlens_password@",
+    ":password@",
+    ":changeme@",
+    ":secret@",
+    ":admin@",
+    ":root@",
+    ":example@",
+    "user:pass@",
+    "trustlens:trustlens@",
+    "postgres:postgres@",
+    "root:root@",
+]
 
 
 class Settings(BaseSettings):
@@ -43,9 +82,13 @@ class Settings(BaseSettings):
     app_secret_key: str = "change-me-to-a-random-secret"
     cors_origins: str = "http://localhost:5173"
 
-    # ── Rate Limits ───────────────────────────────────────────────────────
+    # ── Production Auth Configuration ─────────────────────────────────────
+    jwt_secret_key: str = ""
+
+    # ── Rate Limits & Shared Storage ──────────────────────────────────────
     rate_limit_per_minute: int = 30
     scan_concurrency_limit: int = 5
+    redis_url: str = ""
 
     # ── Evidence Storage ──────────────────────────────────────────────────
     evidence_storage_path: Path = Path("./evidence_store")
@@ -67,7 +110,7 @@ class Settings(BaseSettings):
 
     @property
     def is_production(self) -> bool:
-        return self.app_env == "production"
+        return self.app_env.lower() == "production"
 
     @field_validator("app_secret_key")
     @classmethod
@@ -82,6 +125,65 @@ class Settings(BaseSettings):
             )
         return v
 
+    @model_validator(mode="after")
+    def validate_production_security(self) -> Settings:
+        """Enforce strict security requirements when running in production."""
+        if self.is_production:
+            # 1. Reject default or weak app secret
+            secret = (self.app_secret_key or "").strip()
+            if (
+                not secret
+                or secret in _INSECURE_APP_SECRETS
+                or any(secret.lower().startswith(p) for p in _KNOWN_PLACEHOLDER_PREFIXES)
+                or len(secret) < 32
+            ):
+                raise ValueError(
+                    "Production startup failed: APP_SECRET_KEY is using a default or insecure value. "
+                    "In production, APP_SECRET_KEY must be a cryptographically random secret of at least 32 characters."
+                )
+
+            # 2. Reject default or example database credentials
+            db_url_lower = (self.database_url or "").lower()
+            parsed_db = urlsplit(self.database_url or "")
+            db_password = parsed_db.password or ""
+            if (
+                any(pattern in db_url_lower for pattern in _DEFAULT_DATABASE_PATTERNS)
+                or (db_password and any(db_password.lower().startswith(p) for p in _KNOWN_PLACEHOLDER_PREFIXES))
+                or db_password.lower() in _INSECURE_APP_SECRETS
+            ):
+                raise ValueError(
+                    "Production startup failed: DATABASE_URL contains default or example credentials. "
+                    "Configure a dedicated, secure production database password via environment variables."
+                )
+
+            # 3. Require production auth configuration
+            jwt_secret = (self.jwt_secret_key or "").strip()
+            if (
+                not jwt_secret
+                or jwt_secret in _INSECURE_APP_SECRETS
+                or any(jwt_secret.lower().startswith(p) for p in _KNOWN_PLACEHOLDER_PREFIXES)
+                or len(jwt_secret) < 32
+            ):
+                raise ValueError(
+                    "Production startup failed: Required production auth configuration (JWT_SECRET_KEY) is missing or insecure. "
+                    "Set a secure JWT signing secret of at least 32 characters."
+                )
+
+            # 4. Require explicit CORS allowlist (no wildcards)
+            if not self.cors_origin_list or any("*" in o for o in self.cors_origin_list):
+                raise ValueError(
+                    "Production startup failed: CORS_ORIGINS must be an explicit origin allowlist in production "
+                    "and cannot contain wildcard '*'."
+                )
+
+            # 5. Require Redis URL in production
+            redis_url_str = (self.redis_url or "").strip()
+            if not redis_url_str:
+                raise ValueError(
+                    "Production startup failed: REDIS_URL must be configured in production for shared rate limiting."
+                )
+
+        return self
+
 
 settings = Settings()
-

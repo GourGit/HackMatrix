@@ -51,10 +51,13 @@ class SecurityHeadersMiddleware:
 
         async def _inject_headers(message: Message) -> None:
             if message["type"] == "http.response.start":
+                existing_names = {k.lower() for k, _ in message.get("headers", [])}
                 headers: list[tuple[bytes, bytes]] = list(
                     message.get("headers", [])
                 )
-                headers.extend(self._headers)
+                for h_name, h_val in self._headers:
+                    if h_name.lower() not in existing_names:
+                        headers.append((h_name, h_val))
                 message["headers"] = headers
             await send(message)
 

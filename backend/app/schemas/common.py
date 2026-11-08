@@ -81,6 +81,13 @@ class FindingStatus(str, enum.Enum):
     FALSE_POSITIVE = "false_positive"
 
 
+class ReviewDecision(str, enum.Enum):
+    """Constrained review decisions per docs/agents.md."""
+    ACCEPTED = "accepted"
+    DISPUTED = "disputed"
+    FALSE_POSITIVE = "false_positive"
+
+
 # ── Authorization scope status ───────────────────────────────────────────
 
 class ScopeStatus(str, enum.Enum):

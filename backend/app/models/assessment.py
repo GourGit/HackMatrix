@@ -10,7 +10,7 @@ import uuid
 from datetime import datetime
 
 from sqlalchemy import DateTime, ForeignKey, Index, Integer, String, Text
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.models.base import Base, TenantMixin, TimestampMixin, UUIDMixin
@@ -66,6 +66,11 @@ class Assessment(Base, UUIDMixin, TimestampMixin, TenantMixin):
         String(20),
         nullable=True,
         comment="Scoring algorithm version that produced the score.",
+    )
+    checks_json: Mapped[dict | None] = mapped_column(
+        JSONB,
+        nullable=True,
+        comment="Durable check availability states (ct, revocation, safe_scan, etc.).",
     )
 
     # ── Timestamps ───────────────────────────────────────────────────────
