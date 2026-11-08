@@ -1,24 +1,18 @@
 """Agent 3: Certificate Intelligence Agent.
 
-Captures peer certificates and chain context via read-only TLS handshake,
-validates hostname / SAN, expiry dates, issuer CA trust, key size/algorithm,
-TLS protocol version & ciphers, and checks CT log presence and OCSP/CRL revocation.
-Records unavailable revocation or CT as unknown, never inferred as failure.
+Captures peer certificates via the centralized SSRF-safe egress layer (SafeTlsObservation).
+Validates hostname / SAN, expiry dates, key size/algorithm, TLS protocol version & ciphers,
+and checks CT log presence.
 """
 
 from __future__ import annotations
 
-import asyncio
-import socket
-import ssl
 import uuid
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 
-from cryptography import x509
-from cryptography.hazmat.backends import default_backend
-
 from app.agents.base import AgentExecutionContext, AgentExecutionResult, BaseAgent
+from app.core.egress import default_egress
 from app.core.errors import ErrorCode
 from app.schemas.common import AgentName, AgentRunStatus, EvidenceKind, Severity
 
@@ -59,14 +53,12 @@ class CertificateIntelAgent(BaseAgent):
         port = parsed.port or 443
 
         try:
-            # Perform read-only TLS handshake in executor to avoid blocking event loop
-            loop = asyncio.get_running_loop()
-            cert_info = await loop.run_in_executor(None, self._probe_tls, hostname, port)
-            
+            # Probe TLS via central egress with IP pinning and SSRF validation
+            obs = await default_egress.probe_tls(hostname, port)
+
             # Check Expiry
-            not_after = cert_info.get("not_after")
             now = datetime.now(timezone.utc)
-            if not_after and not_after < now:
+            if obs.not_after and obs.not_after < now:
                 ev_id = uuid.uuid4()
                 result.findings.append(
                     self.create_finding(
@@ -75,15 +67,15 @@ class CertificateIntelAgent(BaseAgent):
                         severity=Severity.CRITICAL,
                         confidence=1.0,
                         title="SSL/TLS Certificate Has Expired",
-                        description=f"The leaf certificate expired on {not_after.isoformat()}.",
+                        description=f"The leaf certificate expired on {obs.not_after.isoformat()}.",
                         affected_asset=hostname,
                         evidence_ids=[ev_id],
                         score_impact=40,
                     )
                 )
 
-            # Check SAN / Hostname
-            sans = cert_info.get("san", [])
+            # Check SAN / Hostname matching
+            sans = obs.san_list or []
             if hostname not in sans and not any(self._matches_wildcard(hostname, san) for san in sans):
                 ev_id = uuid.uuid4()
                 result.findings.append(
@@ -100,9 +92,10 @@ class CertificateIntelAgent(BaseAgent):
                     )
                 )
 
-            # Check Weak Key
-            key_size = cert_info.get("key_size", 2048)
-            if key_size < 2048:
+            # Check Key strength (RSA key sizes < 2048 bits are considered weak)
+            key_type = getattr(obs, "key_type", None)
+            key_size = getattr(obs, "key_size", None)
+            if key_type and str(key_type).upper() == "RSA" and key_size is not None and key_size < 2048:
                 ev_id = uuid.uuid4()
                 result.findings.append(
                     self.create_finding(
@@ -119,14 +112,20 @@ class CertificateIntelAgent(BaseAgent):
                 )
 
             # CT and Revocation availability
-            result.check_availability["ct"] = "passed" if cert_info.get("has_sct") else "unknown"
-            result.check_availability["revocation"] = cert_info.get("revocation_status", "unknown")
+            result.check_availability["ct"] = "passed" if obs.has_sct else "unknown"
+            result.check_availability["revocation"] = "unknown"
 
             ev_id = uuid.uuid4()
             result.raw_evidence.append({
                 "evidence_id": ev_id,
                 "kind": EvidenceKind.CERTIFICATE,
-                "details": cert_info,
+                "peer_ip": obs.peer_ip,
+                "subject": obs.subject,
+                "issuer": obs.issuer,
+                "tls_version": obs.tls_version,
+                "cipher": obs.cipher_name,
+                "key_size": obs.key_size,
+                "key_type": getattr(obs, "key_type", None),
             })
 
             result.status = AgentRunStatus.COMPLETED
@@ -146,45 +145,3 @@ class CertificateIntelAgent(BaseAgent):
             suffix = san[2:]
             return hostname.endswith(suffix) and hostname.count(".") == san.count(".")
         return False
-
-    def _probe_tls(self, hostname: str, port: int) -> dict:
-        ssl_ctx = ssl.create_default_context()
-        # For non-intrusive inspection, we allow inspecting self-signed/untrusted certs to flag them
-        ssl_ctx.check_hostname = False
-        ssl_ctx.verify_mode = ssl.CERT_NONE
-
-        with socket.create_connection((hostname, port), timeout=6.0) as sock:
-            with ssl_ctx.wrap_socket(sock, server_hostname=hostname) as ssock:
-                der_cert = ssock.getpeercert(binary_form=True)
-                cipher = ssock.cipher()
-                tls_version = ssock.version()
-
-                cert = x509.load_der_x509_certificate(der_cert, default_backend())
-
-                sans = []
-                try:
-                    ext = cert.extensions.get_extension_for_oid(x509.ExtensionOID.SUBJECT_ALTERNATIVE_NAME)
-                    sans = ext.value.get_values_for_type(x509.DNSName)
-                except Exception:
-                    pass
-
-                has_sct = False
-                try:
-                    cert.extensions.get_extension_for_oid(x509.ExtensionOID.PRECERT_SIGNED_CERTIFICATE_TIMESTAMPS)
-                    has_sct = True
-                except Exception:
-                    pass
-
-                return {
-                    "subject": cert.subject.rfc4514_string(),
-                    "issuer": cert.issuer.rfc4514_string(),
-                    "not_before": cert.not_valid_before_utc,
-                    "not_after": cert.not_valid_after_utc,
-                    "san": sans,
-                    "has_sct": has_sct,
-                    "revocation_status": "unknown",
-                    "cipher": cipher,
-                    "tls_version": tls_version,
-                    "key_size": getattr(cert.public_key(), "key_size", 2048),
-                }
-

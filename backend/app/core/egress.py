@@ -66,8 +66,9 @@ class SafeTlsObservation:
     has_sct: bool
     tls_version: str
     cipher_name: str
-    key_size: int
-    raw_der: bytes
+    key_size: Optional[int] = None
+    raw_der: bytes = b""
+    key_type: Optional[str] = None
 
 
 class SafeEgressLayer:
@@ -192,10 +193,24 @@ class SafeEgressLayer:
                 elapsed_ms = int((asyncio.get_event_loop().time() - start_time) * 1000)
                 redirect_loc = resp.headers.get("location")
 
+                headers_dict = {k.lower(): v for k, v in resp.headers.items()}
+                # Preserve repeated Set-Cookie headers if present
+                set_cookies: list[str] = []
+                if hasattr(resp.headers, "get_list"):
+                    set_cookies = resp.headers.get_list("set-cookie")
+                elif isinstance(resp.headers, dict):
+                    raw = resp.headers.get("set-cookie") or resp.headers.get("Set-Cookie")
+                    if isinstance(raw, list):
+                        set_cookies = raw
+                    elif raw:
+                        set_cookies = [raw]
+                if len(set_cookies) > 1:
+                    headers_dict["set-cookie"] = "\n".join(set_cookies)
+
                 response_obj = SafeHttpResponse(
                     url=current_url,
                     status_code=resp.status_code,
-                    headers={k.lower(): v for k, v in resp.headers.items()},
+                    headers=headers_dict,
                     body=body_bytes,
                     elapsed_ms=elapsed_ms,
                     peer_ip=target_ip,
@@ -250,7 +265,31 @@ class SafeEgressLayer:
                 except Exception:
                     pass
 
-                key_size = getattr(cert.public_key(), "key_size", 2048)
+                key_size: Optional[int] = None
+                key_type: Optional[str] = None
+                try:
+                    pub_key = cert.public_key()
+                    from cryptography.hazmat.primitives.asymmetric import dsa, ec, ed448, ed25519, rsa
+                    if isinstance(pub_key, rsa.RSAPublicKey):
+                        key_type = "RSA"
+                        key_size = pub_key.key_size
+                    elif isinstance(pub_key, ec.EllipticCurvePublicKey):
+                        key_type = "EC"
+                        key_size = pub_key.key_size
+                    elif isinstance(pub_key, ed25519.Ed25519PublicKey):
+                        key_type = "ED25519"
+                        key_size = 256
+                    elif isinstance(pub_key, ed448.Ed448PublicKey):
+                        key_type = "ED448"
+                        key_size = 448
+                    elif isinstance(pub_key, dsa.DSAPublicKey):
+                        key_type = "DSA"
+                        key_size = pub_key.key_size
+                    else:
+                        key_type = pub_key.__class__.__name__
+                        key_size = getattr(pub_key, "key_size", None)
+                except Exception:
+                    pass
 
                 return SafeTlsObservation(
                     hostname=hostname,
@@ -266,6 +305,7 @@ class SafeEgressLayer:
                     cipher_name=cipher[0] if cipher else "UNKNOWN",
                     key_size=key_size,
                     raw_der=der_cert,
+                    key_type=key_type,
                 )
 
     async def probe_tcp_port(

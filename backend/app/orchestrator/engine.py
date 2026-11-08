@@ -1,18 +1,20 @@
 """Asyncio Orchestrator for TrustLens assessments.
 
-Coordinates the six deterministic agents, handles timeouts, retries,
-records agent runs in PostgreSQL, collects raw evidence, and invokes
-the risk calculation engine and OpenRouter AI summary.
+Coordinates the six deterministic agents, handles timeouts, persists
+execution records, stores raw evidence with SHA-256 content hashing and secret
+redaction, associates findings with evidence via junction records, executes the
+risk engine, and records accurate check statuses.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import uuid
-from datetime import datetime, timezone
-from typing import List
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, List, Optional
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agents.base import AgentExecutionContext, AgentExecutionResult
@@ -22,11 +24,20 @@ from app.agents.privacy_software import PrivacySoftwareAgent
 from app.agents.safe_surface import SafeSurfaceAgent
 from app.agents.threat_intel import ThreatIntelAgent
 from app.agents.url_redirect import UrlRedirectAgent
+from app.config import settings
+from app.core.evidence_store import EvidenceMetadata, EvidenceStore, redact_secrets
 from app.core.scoring import FindingScore, RiskScoreCalculator
 from app.models.agent_run import AgentRun
 from app.models.assessment import Assessment
+from app.models.evidence import Evidence
 from app.models.finding import Finding
-from app.schemas.common import AgentName, AgentRunStatus, AssessmentStatus, CheckAvailability, score_to_band
+from app.schemas.common import (
+    AgentName,
+    AgentRunStatus,
+    AssessmentStatus,
+    EvidenceKind,
+    score_to_band,
+)
 
 
 class AssessmentOrchestrator:
@@ -41,6 +52,7 @@ class AssessmentOrchestrator:
             ThreatIntelAgent(),
         ]
         self.scorer = RiskScoreCalculator()
+        self.evidence_store = EvidenceStore()
 
     async def execute_assessment(
         self,
@@ -49,8 +61,7 @@ class AssessmentOrchestrator:
         safe_scan_ports: list[int] | None = None,
         crypto_scam_analysis: bool = False,
     ) -> Assessment:
-        """Runs all 6 agents concurrently and updates the database records."""
-        # 1. Fetch Assessment
+        """Runs all 6 agents concurrently and persists evidence, findings, and risk metrics."""
         stmt = select(Assessment).where(Assessment.id == assessment_id)
         res = await self.db.execute(stmt)
         assessment = res.scalar_one_or_none()
@@ -60,107 +71,174 @@ class AssessmentOrchestrator:
         assessment.status = AssessmentStatus.RUNNING.value
         await self.db.commit()
 
-        # Ensure safe-scan ports default to an empty list, never an implicit broad port set
         effective_safe_scan_ports = list(safe_scan_ports) if safe_scan_ports is not None else []
 
-        # 2. Build Execution Contexts & Agent Run Records
         tasks = []
-        run_records = {}
+        run_records: Dict[AgentName, AgentRun] = {}
+        agents_by_name = {a.agent_name: a for a in self.agents}
 
-        for agent in self.agents:
-            run_id = uuid.uuid4()
-            agent_run = AgentRun(
-                id=run_id,
-                assessment_id=assessment.id,
-                agent_name=agent.agent_name.value,
-                status=AgentRunStatus.RUNNING.value,
-                rule_version=agent.rule_version,
-                started_at=datetime.now(timezone.utc),
-            )
-            self.db.add(agent_run)
-            run_records[agent.agent_name] = agent_run
-
-            ctx = AgentExecutionContext(
-                assessment_id=assessment.id,
-                run_id=run_id,
-                target_url=assessment.submitted_url,
-                normalized_url=assessment.normalized_url,
-                scope_id=assessment.scope_id,
-                safe_scan_enabled=safe_scan_enabled,
-                safe_scan_ports=effective_safe_scan_ports,
-                crypto_scam_analysis=crypto_scam_analysis,
-            )
-            tasks.append(self._run_with_timeout(agent, ctx))
-
-        await self.db.commit()
-
-        # 3. Concurrently run all agents
-        results: List[AgentExecutionResult] = await asyncio.gather(*tasks, return_exceptions=False)
-
-        # 4. Process Findings and Update Agent Runs
-        all_finding_scores: List[FindingScore] = []
-        checks = {
-            "ct": "unknown",
-            "revocation": "unknown",
-            "safeScan": "not_requested",
-        }
-
-        has_partial_failures = False
-
-        for res in results:
-            run_rec = run_records[res.agent_name]
-            run_rec.status = res.status.value
-            run_rec.ended_at = res.ended_at or datetime.now(timezone.utc)
-            run_rec.error_code = res.error_code
-
-            if res.status != AgentRunStatus.COMPLETED:
-                has_partial_failures = True
-
-            # Merge checks
-            for k, v in res.check_availability.items():
-                checks[k] = v
-
-            # Insert findings into DB
-            for f in res.findings:
-                finding_db = Finding(
-                    id=f.finding_id,
+        try:
+            for agent in self.agents:
+                run_id = uuid.uuid4()
+                agent_run = AgentRun(
+                    id=run_id,
                     assessment_id=assessment.id,
-                    agent_run_id=run_rec.id,
-                    type=f.type,
-                    severity=f.severity.value,
-                    confidence=f.confidence,
-                    score_impact=f.score_impact,
-                    status=f.status,
-                    asset=f.affected_asset,
-                    summary=f.title,
-                    rule_version=f.rule_version,
-                    observed_at=f.observed_at,
+                    agent_name=agent.agent_name.value,
+                    status=AgentRunStatus.RUNNING.value,
+                    rule_version=agent.rule_version,
+                    started_at=datetime.now(timezone.utc),
                 )
-                self.db.add(finding_db)
+                self.db.add(agent_run)
+                run_records[agent.agent_name] = agent_run
 
-                all_finding_scores.append(
-                    FindingScore(
-                        finding_id=f.finding_id,
-                        severity=f.severity,
-                        confidence=f.confidence,
+                ctx = AgentExecutionContext(
+                    assessment_id=assessment.id,
+                    run_id=run_id,
+                    target_url=assessment.submitted_url,
+                    normalized_url=assessment.normalized_url,
+                    scope_id=assessment.scope_id,
+                    safe_scan_enabled=safe_scan_enabled,
+                    safe_scan_ports=effective_safe_scan_ports,
+                    crypto_scam_analysis=crypto_scam_analysis,
+                )
+                tasks.append(self._run_with_timeout(agent, ctx))
+
+            await self.db.commit()
+
+            # Run agents with isolation & timeout
+            results: List[AgentExecutionResult] = await asyncio.gather(*tasks, return_exceptions=False)
+
+            all_finding_scores: List[FindingScore] = []
+            has_partial_failures = False
+            now_utc = datetime.now(timezone.utc)
+            retention_deadline = now_utc + timedelta(days=settings.evidence_retention_days)
+
+            for res in results:
+                run_rec = run_records[res.agent_name]
+                run_rec.status = res.status.value
+                run_rec.ended_at = res.ended_at or datetime.now(timezone.utc)
+                run_rec.error_code = res.error_code
+
+                current_agent = agents_by_name.get(res.agent_name)
+                rule_version = current_agent.rule_version if current_agent else "2026-1"
+
+                if res.status != AgentRunStatus.COMPLETED:
+                    has_partial_failures = True
+
+                # 1. Persist Raw Evidence Items
+                evidence_map: Dict[uuid.UUID, Evidence] = {}
+                for item in res.raw_evidence:
+                    ev_id = item.get("evidence_id", uuid.uuid4())
+                    kind_val = item.get("kind", EvidenceKind.PROVIDER_RESULT)
+                    kind_str = kind_val.value if hasattr(kind_val, "value") else str(kind_val)
+
+                    # Redact sensitive parameters and serialize
+                    payload_json = json.dumps(item, default=str)
+                    redacted_json = redact_secrets(payload_json)
+                    content_bytes = redacted_json.encode("utf-8")
+
+                    meta = EvidenceMetadata(
+                        source_uri=assessment.submitted_url,
+                        collector_version=rule_version,
                     )
+                    try:
+                        stored = await self.evidence_store.store(content_bytes, meta)
+
+                        ev_model = Evidence(
+                            id=ev_id,
+                            assessment_id=assessment.id,
+                            agent_run_id=run_rec.id,
+                            kind=kind_str,
+                            source_uri=assessment.submitted_url,
+                            content_hash=stored.content_hash,
+                            storage_ref=stored.storage_ref,
+                            collected_at=now_utc,
+                            collector_version=rule_version,
+                            redaction_version="1.0",
+                            retention_until=retention_deadline,
+                        )
+                        self.db.add(ev_model)
+                        evidence_map[ev_id] = ev_model
+                    except Exception:
+                        has_partial_failures = True
+                        if run_rec.status == AgentRunStatus.COMPLETED.value:
+                            run_rec.status = AgentRunStatus.PARTIAL.value
+                        if not run_rec.error_code:
+                            run_rec.error_code = "EVIDENCE_STORAGE_FAILED"
+
+                # 2. Persist Findings and associate with Evidence
+                for f in res.findings:
+                    finding_db = Finding(
+                        id=f.finding_id,
+                        assessment_id=assessment.id,
+                        agent_run_id=run_rec.id,
+                        type=f.type,
+                        severity=f.severity.value,
+                        confidence=f.confidence,
+                        score_impact=f.score_impact,
+                        status=f.status,
+                        asset=f.affected_asset,
+                        summary=f.title,
+                        rule_version=f.rule_version,
+                        observed_at=f.observed_at,
+                    )
+
+                    # Link associated evidence
+                    for ev_id in f.evidence_ids:
+                        if ev_id in evidence_map:
+                            finding_db.evidence_items.append(evidence_map[ev_id])
+
+                    self.db.add(finding_db)
+
+                    all_finding_scores.append(
+                        FindingScore(
+                            finding_id=str(f.finding_id),
+                            severity=f.severity,
+                            confidence=f.confidence,
+                        )
+                    )
+
+            # 3. Deterministic Risk Engine Scoring
+            risk_result = self.scorer.calculate(all_finding_scores)
+
+            # 4. Finalize Assessment
+            assessment.score = risk_result.score
+            assessment.score_band = risk_result.band.value
+            assessment.score_version = risk_result.version
+            assessment.status = (
+                AssessmentStatus.PARTIAL.value if has_partial_failures else AssessmentStatus.COMPLETED.value
+            )
+            assessment.completed_at = datetime.now(timezone.utc)
+
+            await self.db.commit()
+            await self.db.refresh(assessment)
+            return assessment
+
+        except Exception:
+            await self.db.rollback()
+            now_failed = datetime.now(timezone.utc)
+            await self.db.execute(
+                update(Assessment)
+                .where(Assessment.id == assessment_id)
+                .values(
+                    status=AssessmentStatus.FAILED.value,
+                    completed_at=now_failed,
                 )
-
-        # 5. Deterministic Risk Engine Scoring
-        risk_result = self.scorer.calculate(all_finding_scores)
-
-        # 6. Finalize Assessment
-        assessment.score = risk_result.score
-        assessment.score_band = risk_result.band.value
-        assessment.score_version = risk_result.version
-        assessment.status = (
-            AssessmentStatus.PARTIAL.value if has_partial_failures else AssessmentStatus.COMPLETED.value
-        )
-        assessment.completed_at = datetime.now(timezone.utc)
-
-        await self.db.commit()
-        await self.db.refresh(assessment)
-        return assessment
+            )
+            await self.db.execute(
+                update(AgentRun)
+                .where(
+                    AgentRun.assessment_id == assessment_id,
+                    AgentRun.status == AgentRunStatus.RUNNING.value,
+                )
+                .values(
+                    status=AgentRunStatus.FAILED.value,
+                    ended_at=now_failed,
+                    error_code="ORCHESTRATOR_ERROR",
+                )
+            )
+            await self.db.commit()
+            raise
 
     async def _run_with_timeout(self, agent, ctx: AgentExecutionContext) -> AgentExecutionResult:
         try:
@@ -181,4 +259,3 @@ class AssessmentOrchestrator:
                 error_message=str(e),
                 ended_at=datetime.now(timezone.utc),
             )
-

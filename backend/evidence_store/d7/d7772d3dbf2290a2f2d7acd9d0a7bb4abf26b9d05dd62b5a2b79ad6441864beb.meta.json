@@ -1,0 +1,6 @@
+{
+  "source_uri": "https://example.com",
+  "collector_version": "custom-rule-v0",
+  "redaction_version": "1.0",
+  "collected_at": "2026-11-08T07:57:45.303285+00:00"
+}
