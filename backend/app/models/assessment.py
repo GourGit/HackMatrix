@@ -28,10 +28,10 @@ class Assessment(Base, UUIDMixin, TimestampMixin, TenantMixin):
     __tablename__ = "assessments"
 
     # ── Scope link ───────────────────────────────────────────────────────
-    scope_id: Mapped[uuid.UUID] = mapped_column(
+    scope_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True),
-        ForeignKey("authorization_scopes.id", ondelete="CASCADE"),
-        nullable=False,
+        ForeignKey("authorization_scopes.id", ondelete="SET NULL"),
+        nullable=True,
         index=True,
     )
 
@@ -80,7 +80,7 @@ class Assessment(Base, UUIDMixin, TimestampMixin, TenantMixin):
     )
 
     # ── Relationships ────────────────────────────────────────────────────
-    scope: Mapped["AuthorizationScope"] = relationship(
+    scope: Mapped["AuthorizationScope | None"] = relationship(
         "AuthorizationScope",
         back_populates="assessments",
     )

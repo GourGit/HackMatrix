@@ -22,6 +22,7 @@ import structlog
 from fastapi import FastAPI, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.config import settings
 from app.core.errors import ErrorCode, TrustLensError
@@ -143,6 +144,29 @@ def _register_exception_handlers(app: FastAPI) -> None:
         return JSONResponse(
             status_code=exc.status_code,
             content=exc.to_response(request_id),
+        )
+
+    @app.exception_handler(StarletteHTTPException)
+    async def _http_exception_handler(
+        request: Request, exc: StarletteHTTPException
+    ) -> JSONResponse:
+        """Map HTTP exceptions to the standard API error envelope."""
+        request_id = _get_request_id(request)
+        code = "UNAUTHORIZED" if exc.status_code == 401 else (
+            ErrorCode.UNAUTHORIZED_SCOPE if exc.status_code == 403 else (
+                ErrorCode.NOT_FOUND if exc.status_code == 404 else ErrorCode.INTERNAL_ERROR
+            )
+        )
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={
+                "error": {
+                    "code": code,
+                    "message": exc.detail if isinstance(exc.detail, str) else "Request failed.",
+                    "requestId": request_id,
+                }
+            },
+            headers=getattr(exc, "headers", None),
         )
 
     @app.exception_handler(RequestValidationError)

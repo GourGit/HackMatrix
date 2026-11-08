@@ -141,7 +141,11 @@ async def create_assessment(
     safe_scan_requested = bool(payload.safe_scan and payload.safe_scan.enabled)
     requested_ports = payload.safe_scan.ports if (payload.safe_scan and payload.safe_scan.ports) else []
 
-    if scope_id:
+    if safe_scan_requested:
+        if not scope_id:
+            raise UnauthorizedScopeError(
+                "Active safe scanning requires an explicit authorized scope."
+            )
         stmt = select(AuthorizationScope).where(
             AuthorizationScope.id == scope_id,
             AuthorizationScope.tenant_id == identity.tenant_id,
@@ -156,29 +160,30 @@ async def create_assessment(
         validate_scope_authorization(
             scope=scope,
             normalized_url=norm_result.normalized_str,
-            safe_scan_requested=safe_scan_requested,
+            safe_scan_requested=True,
             requested_ports=requested_ports,
         )
     else:
-        # Development auto-scope only permitted in non-production
-        if settings.is_production:
-            raise UnauthorizedScopeError("Explicit pre-registered scope_id is required in production.")
-
-        now = datetime.now(timezone.utc)
-        scope_id = uuid.uuid4()
-        scope = AuthorizationScope(
-            id=scope_id,
-            tenant_id=identity.tenant_id,
-            subject_id=identity.subject_id,
-            targets_json=[norm_result.normalized_str],
-            allowed_ports_json=requested_ports if safe_scan_requested else None,
-            valid_from=now,
-            valid_until=now + timedelta(days=7),
-            attestation="Development auto-attestation",
-            status=ScopeStatus.ACTIVE.value,
-        )
-        db.add(scope)
-        await db.flush()
+        # Passive assessment: does not require an explicit scope
+        if scope_id:
+            stmt = select(AuthorizationScope).where(
+                AuthorizationScope.id == scope_id,
+                AuthorizationScope.tenant_id == identity.tenant_id,
+            )
+            res = await db.execute(stmt)
+            scope = res.scalar_one_or_none()
+            if not scope:
+                raise UnauthorizedScopeError(
+                    f"Authorization scope {scope_id} does not exist or belongs to another tenant."
+                )
+            validate_scope_authorization(
+                scope=scope,
+                normalized_url=norm_result.normalized_str,
+                safe_scan_requested=False,
+                requested_ports=[],
+            )
+        else:
+            scope_id = None
 
     # 3. Check Crypto Scam option against server feature flag
     crypto_analysis = bool(
@@ -213,7 +218,7 @@ async def create_assessment(
         content={
             "assessmentId": str(assessment.id),
             "status": AssessmentStatus.QUEUED.value,
-            "scopeId": str(scope_id),
+            "scopeId": str(scope_id) if scope_id else None,
         },
         headers={"X-Request-ID": request_id},
     )

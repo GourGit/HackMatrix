@@ -23,6 +23,7 @@ dependencies = [
     "aiofiles>=24.1.0",
     "slowapi>=0.1.9",
     "redis>=5.0.1",
+    "pyjwt>=2.8.0",
 ]
 
 [project.optional-dependencies]

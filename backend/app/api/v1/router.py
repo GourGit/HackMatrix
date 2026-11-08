@@ -9,6 +9,7 @@ from __future__ import annotations
 from fastapi import APIRouter
 
 from app.api.v1.assessments import router as assessments_router
+from app.api.v1.auth import router as auth_router
 from app.api.v1.evidence import router as evidence_router
 from app.api.v1.findings import router as findings_router
 from app.api.v1.indicators import router as indicators_router
@@ -16,6 +17,7 @@ from app.api.v1.scopes import router as scopes_router
 
 v1_router = APIRouter(prefix="/v1")
 
+v1_router.include_router(auth_router)
 v1_router.include_router(assessments_router)
 v1_router.include_router(scopes_router)
 v1_router.include_router(evidence_router)

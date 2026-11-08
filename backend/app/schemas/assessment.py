@@ -47,7 +47,7 @@ class AuthorizationInput(BaseModel):
     )
     scope_id: uuid.UUID | None = Field(
         default=None,
-        description="Scope identifier covering the target host. Optional in dev.",
+        description="Scope identifier covering the target host. Optional for passive assessments.",
         examples=["a1b2c3d4-e5f6-7890-abcd-ef1234567890"],
     )
 
@@ -147,9 +147,9 @@ class CreateAssessmentResponse(BaseModel):
         description="Initial status — always 'queued' at creation time.",
         examples=["queued"],
     )
-    scope_id: uuid.UUID = Field(
-        ...,
-        description="Scope identifier that was bound to this assessment.",
+    scope_id: uuid.UUID | None = Field(
+        default=None,
+        description="Scope identifier that was bound to this assessment, if any.",
         examples=["a1b2c3d4-e5f6-7890-abcd-ef1234567890"],
     )
 

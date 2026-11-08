@@ -84,6 +84,10 @@ class Settings(BaseSettings):
 
     # ── Production Auth Configuration ─────────────────────────────────────
     jwt_secret_key: str = ""
+    jwt_algorithm: str = "HS256"
+    jwt_issuer: str = "trustlens"
+    jwt_audience: str = "trustlens-api"
+    visitor_session_lifetime_seconds: int = 86400  # 24 hours (86400 seconds)
 
     # ── Rate Limits & Shared Storage ──────────────────────────────────────
     rate_limit_per_minute: int = 30

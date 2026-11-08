@@ -15,16 +15,9 @@ from typing import Optional
 from fastapi import Depends, Header, HTTPException, Request, status
 
 from app.config import settings
+from app.core.auth import AuthenticatedIdentity, verify_token
 from app.core.errors import ErrorCode, TrustLensError
 from app.database import get_db  # noqa: F401
-
-
-@dataclass(frozen=True)
-class AuthenticatedIdentity:
-    """Authenticated principal context."""
-    tenant_id: uuid.UUID
-    subject_id: uuid.UUID
-    is_admin: bool = False
 
 
 # Default dev identity for test environments
@@ -62,14 +55,9 @@ def get_current_identity(
                     status_code=status.HTTP_401_UNAUTHORIZED,
                     detail="Development tokens are not permitted in production.",
                 )
-            # Production token verification path
-            # For now, require valid production token format or reject
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid or expired production token.",
-            )
+            return verify_token(token)
 
-        # Non-production: accept only explicitly permitted dev-token formats:
+        # Non-production: accept explicitly permitted dev-token formats:
         # "dev-token" or "dev-token:<tenant_uuid>:<subject_uuid>"
         if token == "dev-token":
             return AuthenticatedIdentity(
@@ -94,10 +82,8 @@ def get_current_identity(
                 detail="Invalid development token format. Expected dev-token or dev-token:<tenant_id>:<subject_id>.",
             )
         else:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid authorization token.",
-            )
+            # If not a dev token, verify as a standard JWT token
+            return verify_token(token)
 
     # 2. Explicit headers (allowed in dev / test)
     if x_tenant_id and not settings.is_production:

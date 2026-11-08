@@ -67,3 +67,12 @@ export interface CreateAssessmentPayload {
     cryptoScamAnalysis?: boolean;
   };
 }
+
+export interface AnonymousSessionResponse {
+  accessToken: string;
+  tokenType: string;
+  expiresIn: number;
+  tenantId: string;
+  subjectId: string;
+}
+

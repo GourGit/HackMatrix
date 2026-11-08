@@ -12,7 +12,7 @@ import {
   RefreshCw,
   Info
 } from 'lucide-react';
-import { createAssessment, getAssessment } from './api/client';
+import { createAssessment, getAssessment, getOrInitVisitorSession } from './api/client';
 import { AssessmentDetail, Finding, CheckStatus } from './types';
 
 export default function App() {
@@ -22,6 +22,13 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
   const [assessmentId, setAssessmentId] = useState<string | null>(null);
   const [assessment, setAssessment] = useState<AssessmentDetail | null>(null);
+
+  // Proactively initialize visitor session on page load
+  useEffect(() => {
+    getOrInitVisitorSession().catch((err) => {
+      console.warn('Initial visitor session handshake failed:', err);
+    });
+  }, []);
 
   // Poll assessment while queued or running
   useEffect(() => {
