@@ -114,14 +114,24 @@ def validate_ip_safety(ip: str) -> None:
 async def resolve_and_validate(hostname: str) -> list[str]:
     """Resolve *hostname* via DNS and validate every returned IP.
 
-    If hostname is already an IP address literal, validates it directly
+    If hostname is already an IP address literal or localhost, validates it directly
     without performing a remote DNS query.
     """
+    clean_host = hostname.strip().lower().rstrip(".")
+    if (
+        clean_host in ("localhost", "localhost.localdomain", "ip6-localhost", "ip6-loopback")
+        or clean_host.endswith(".localhost")
+    ):
+        raise UnsafeTargetError(
+            "The target hostname resolves to loopback/localhost and is not allowed.",
+            detail={"hostname": hostname, "reason": "localhost"},
+        )
+
     # Check IP literal directly
     try:
-        ipaddress.ip_address(hostname)
-        validate_ip_safety(hostname)
-        return [hostname]
+        ipaddress.ip_address(clean_host)
+        validate_ip_safety(clean_host)
+        return [clean_host]
     except ValueError:
         pass
 

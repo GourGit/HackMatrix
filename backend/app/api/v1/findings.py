@@ -1,8 +1,8 @@
 """Finding review endpoint.
 
-Allows a reviewer to record an ``accepted``, ``disputed``, or
-``false_positive`` verdict on a specific finding, creating an audit
-event for compliance traceability.
+Allows an authorized reviewer to record an accepted, disputed, or
+false_positive verdict on a specific finding, creating an immutable
+audit event with full actor lineage.
 """
 
 from __future__ import annotations
@@ -13,17 +13,20 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, Path, status
 from fastapi.responses import JSONResponse
-from sqlalchemy import select, update
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import get_db, get_request_id, get_tenant_id
-from app.core.errors import NotFoundError, TrustLensError, ErrorCode
+from app.api.deps import AuthenticatedIdentity, get_current_identity, get_db, get_request_id
+from app.core.errors import ErrorCode, NotFoundError, TrustLensError
 from app.middleware.rate_limit import limiter
+from app.models.assessment import Assessment
+from app.models.audit import AuditEvent
+from app.models.finding import Finding
 from app.schemas.common import FindingStatus
+from app.schemas.finding import FindingReviewRequest
 
 router = APIRouter(prefix="/findings", tags=["findings"])
 
-# Valid review decisions.
 _VALID_DECISIONS = {
     FindingStatus.ACCEPTED.value,
     FindingStatus.DISPUTED.value,
@@ -39,89 +42,74 @@ _VALID_DECISIONS = {
 )
 @limiter.limit("20/minute")
 async def review_finding(
-    request: Any,
+    payload: FindingReviewRequest,
     finding_id: uuid.UUID = Path(..., description="Finding UUID"),
     *,
     db: AsyncSession = Depends(get_db),
     request_id: str = Depends(get_request_id),
-    tenant_id: uuid.UUID = Depends(get_tenant_id),
+    identity: AuthenticatedIdentity = Depends(get_current_identity),
 ) -> JSONResponse:
     """Record a review decision on the specified finding.
 
-    Expected JSON body::
-
-        {
-            "decision": "accepted" | "disputed" | "false_positive",
-            "rationale": "Free-text explanation"
-        }
-
-    An audit event is persisted alongside the status change so that
-    review history is immutable and traceable.
+    Persists the updated review status, reviewer actor ID, and an append-only
+    audit event storing previous status and review rationale.
     """
-    from app.models.finding import Finding  # type: ignore[import-untyped]
-
-    body = await request.json()
-    decision = body.get("decision", "")
-    rationale = body.get("rationale", "")
+    decision = payload.status.value if hasattr(payload.status, "value") else str(payload.status)
+    rationale = payload.rationale or ""
 
     if decision not in _VALID_DECISIONS:
         raise TrustLensError(
             code=ErrorCode.VALIDATION_ERROR,
-            message=(
-                f"Invalid decision '{decision}'. "
-                f"Must be one of: {', '.join(sorted(_VALID_DECISIONS))}."
-            ),
+            message=f"Invalid decision '{decision}'. Must be one of: {', '.join(sorted(_VALID_DECISIONS))}.",
             status_code=422,
         )
 
-    # Load the finding with tenant isolation.
-    stmt = select(Finding).where(Finding.id == finding_id)
+    # Load finding and join assessment to enforce tenant boundary
+    stmt = (
+        select(Finding)
+        .join(Assessment, Finding.assessment_id == Assessment.id)
+        .where(
+            Finding.id == finding_id,
+            Assessment.tenant_id == identity.tenant_id,
+        )
+    )
     result = await db.execute(stmt)
     finding = result.scalar_one_or_none()
 
     if finding is None:
         raise NotFoundError("Finding", detail=str(finding_id))
 
-    # Check tenant ownership via the parent assessment.
-    finding_tenant = getattr(finding, "tenant_id", None)
-    if finding_tenant is not None and finding_tenant != tenant_id:
-        raise NotFoundError("Finding", detail=str(finding_id))
+    prior_status = finding.status
 
-    # Update status.
+    # Update status
     finding.status = decision
-    finding.reviewed_at = datetime.now(timezone.utc)
-    finding.review_rationale = rationale
+    review_time = datetime.now(timezone.utc)
 
-    # Persist an audit event if the model supports it.
-    try:
-        from app.models.audit import AuditEvent  # type: ignore[import-untyped]
-
-        audit = AuditEvent(
-            id=uuid.uuid4(),
-            tenant_id=tenant_id,
-            entity_type="finding",
-            entity_id=finding_id,
-            action="review",
-            payload={
-                "decision": decision,
-                "rationale": rationale,
-                "previous_status": getattr(finding, "status", "active"),
-            },
-            created_at=datetime.now(timezone.utc),
-        )
-        db.add(audit)
-    except ImportError:
-        # Audit model not yet available — skip for MVP.
-        pass
-
-    await db.flush()
+    # Append-only audit trail
+    audit = AuditEvent(
+        id=uuid.uuid4(),
+        tenant_id=identity.tenant_id,
+        actor_id=identity.subject_id,
+        action="finding.reviewed",
+        entity_type="finding",
+        entity_id=finding_id,
+        metadata_json={
+            "decision": decision,
+            "rationale": rationale,
+            "previous_status": prior_status,
+        },
+        occurred_at=review_time,
+    )
+    db.add(audit)
+    await db.commit()
 
     return JSONResponse(
         status_code=status.HTTP_200_OK,
         content={
             "findingId": str(finding_id),
             "status": decision,
-            "reviewedAt": datetime.now(timezone.utc).isoformat(),
+            "reviewedAt": review_time.isoformat(),
+            "reviewerId": str(identity.subject_id),
         },
         headers={"X-Request-ID": request_id},
     )
